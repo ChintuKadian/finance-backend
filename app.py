@@ -43,17 +43,19 @@ def get_transactions():
 @app.route("/transactions", methods=["POST"])
 def add_transaction():
     data = request.get_json()
-    print("Received data:", data)
     new_tx = {
+        "userId": "default_user",  # ✅ Add this line (required by DynamoDB)
         "id": str(uuid.uuid4()),
-        "amount": Decimal(str(data.get("amount", 0))),
+        "amount": data.get("amount"),
         "category": data.get("category"),
         "date": data.get("date", datetime.now().strftime("%Y-%m-%d")),
         "note": data.get("note", ""),
         "type": data.get("type", "expense")
     }
+
+    print("Adding transaction:", new_tx)  # Optional for debugging
     transactions_table.put_item(Item=new_tx)
-    return jsonify(decimal_to_float(new_tx)), 201
+    return jsonify(new_tx), 201
 
 
 # ---- Summary ----

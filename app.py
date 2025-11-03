@@ -78,25 +78,48 @@ def get_summary():
 # ---- Get Budget ----
 @app.route("/budget", methods=["GET"])
 def get_budget():
-    # assuming only one budget record per month
-    response = budget_table.scan()
-    items = response.get('Items', [])
-    if not items:
-        return jsonify({"message": "No budget found"}), 404
-    return jsonify(decimal_to_float(items[0]))
+    print("🔍 [GET /budget] Fetching budget from table:", budget_table.name)
+
+    try:
+        response = budget_table.scan()
+        items = response.get('Items', [])
+        print("✅ [GET /budget] Items fetched:", items)
+
+        if not items:
+            print("⚠️ [GET /budget] No budget data found in DynamoDB.")
+            return jsonify({"message": "No budget found"}), 404
+
+        return jsonify(decimal_to_float(items[0]))
+
+    except Exception as e:
+        print("❌ [GET /budget] Error while fetching:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 
 # ---- Set Budget ----
 @app.route("/budget", methods=["POST"])
 def set_budget():
     data = request.get_json()
-    budget_item = {
-        "month": data.get("month", datetime.now().strftime("%Y-%m")),
-        "amount": Decimal(str(data.get("amount", 0))),
-        "spent": Decimal(str(data.get("spent", 0)))
-    }
-    budget_table.put_item(Item=budget_item)
-    return jsonify(decimal_to_float(budget_item))
+    print("📩 [POST /budget] Received data from frontend:", data)
+
+    try:
+        budget_item = {
+            "month": data.get("month", datetime.now().strftime("%Y-%m")),
+            "amount": Decimal(str(data.get("amount", 0))),
+            "spent": Decimal(str(data.get("spent", 0)))
+        }
+
+        print("🧾 [POST /budget] Final data to insert into DynamoDB:", budget_item)
+
+        # Send data to DynamoDB
+        budget_table.put_item(Item=budget_item)
+        print("✅ [POST /budget] Item successfully inserted into DynamoDB.")
+
+        return jsonify(decimal_to_float(budget_item))
+
+    except Exception as e:
+        print("❌ [POST /budget] Error while inserting:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------- Run Server ----------

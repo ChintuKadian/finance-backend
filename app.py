@@ -45,7 +45,7 @@ def add_transaction():
     data = request.get_json()
     new_tx = {
         "userId": "default_user",  # ✅ Add this line (required by DynamoDB)
-        "id": str(uuid.uuid4()),
+        "transactionId": str(uuid.uuid4()),
         "amount": data.get("amount"),
         "category": data.get("category"),
         "date": data.get("date", datetime.now().strftime("%Y-%m-%d")),

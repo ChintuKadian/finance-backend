@@ -4,7 +4,7 @@ boto3
 botocore
 certifi==2025.10.5
 charset-normalizer==3.4.4
-click==8.3.0
+click==8.1.8
 colorama==0.4.6
 docutils==0.19
 Flask==3.1.2

@@ -11,7 +11,7 @@ CORS(app)
 # ---------- DynamoDB Setup ----------
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')  # change region if needed
 transactions_table = dynamodb.Table('Transactions')
-budget_table = dynamodb.Table('Budget')
+budget_table = dynamodb.Table('UserBudgets')
 
 # ---------- Helper function ----------
 def decimal_to_float(obj):

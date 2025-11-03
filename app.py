@@ -76,11 +76,12 @@ def get_summary():
 
 
 # ---- Get Budget ----
+# ---- Get Budget ----
 @app.route("/budget", methods=["GET"])
 def get_budget():
     print("🔍 [GET /budget] Fetching budget from table:", budget_table.name)
-
     try:
+        # Scan all budget entries (for now, assuming one budget per user)
         response = budget_table.scan()
         items = response.get('Items', [])
         print("✅ [GET /budget] Items fetched:", items)
@@ -89,7 +90,17 @@ def get_budget():
             print("⚠️ [GET /budget] No budget data found in DynamoDB.")
             return jsonify({"message": "No budget found"}), 404
 
-        return jsonify(decimal_to_float(items[0]))
+        # Take first item and format it for frontend
+        item = items[0]
+        budget_data = {
+            "month": item.get("month", datetime.now().strftime("%Y-%m")),
+            "amount": float(item.get("budgetLimit", item.get("amount", 0))),
+            "spent": float(item.get("spent", 0)),
+            "category": item.get("category", "General")
+        }
+
+        print("✅ [GET /budget] Formatted data for frontend:", budget_data)
+        return jsonify(budget_data)
 
     except Exception as e:
         print("❌ [GET /budget] Error while fetching:", str(e))
@@ -99,26 +110,35 @@ def get_budget():
 # ---- Set Budget ----
 @app.route("/budget", methods=["POST"])
 def set_budget():
-    data = request.get_json()
-    print("📩 [POST /budget] Received data from frontend:", data)
-
     try:
+        data = request.get_json()
+        print("📩 [POST /budget] Data received from frontend:", data)
+
+        # Build item to store in DynamoDB
         budget_item = {
+            "userId": "default_user",  # adjust this if you have user auth later
             "month": data.get("month", datetime.now().strftime("%Y-%m")),
-            "amount": Decimal(str(data.get("amount", 0))),
+            "category": data.get("category", "General"),
+            "budgetLimit": Decimal(str(data.get("amount", 0))),
             "spent": Decimal(str(data.get("spent", 0)))
         }
 
-        print("🧾 [POST /budget] Final data to insert into DynamoDB:", budget_item)
-
-        # Send data to DynamoDB
+        print("🪣 [POST /budget] Saving item to DynamoDB:", budget_item)
         budget_table.put_item(Item=budget_item)
-        print("✅ [POST /budget] Item successfully inserted into DynamoDB.")
 
-        return jsonify(decimal_to_float(budget_item))
+        # Prepare response for frontend
+        response_data = {
+            "month": budget_item["month"],
+            "amount": float(budget_item["budgetLimit"]),
+            "spent": float(budget_item["spent"]),
+            "category": budget_item["category"]
+        }
+
+        print("✅ [POST /budget] Saved successfully:", response_data)
+        return jsonify(response_data)
 
     except Exception as e:
-        print("❌ [POST /budget] Error while inserting:", str(e))
+        print("❌ [POST /budget] Error while saving:", str(e))
         return jsonify({"error": str(e)}), 500
 
 

@@ -91,7 +91,7 @@ def get_budget():
         print(f"❌ [GET /budget] Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-
+# ---- add budgets 
 @app.route("/budget", methods=["POST"])
 def set_budget():
     try:
@@ -100,7 +100,7 @@ def set_budget():
 
         user_id = data.get("userId", "default_user")
         month = data.get("month", datetime.now().strftime("%Y-%m"))
-        budget_limit = Decimal(str(data.get("budgetLimit", 0)))
+        budget_limit = Decimal(str(data.get("budgetLimit") or data.get("amount", 0)))
         spent = Decimal(str(data.get("spent", 0)))
         category = data.get("category", "General")
 

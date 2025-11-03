@@ -1,77 +1,68 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime
+import boto3
 import uuid
+from decimal import Decimal
 
 app = Flask(__name__)
-CORS(app)  # enable CORS for all routes
+CORS(app)
 
-# Mock database
-transactions = [
-    {
-        "id": "1",
-        "amount": 5000,
-        "category": "Salary",
-        "date": "2025-10-01",
-        "note": "Monthly salary",
-        "type": "income"
-    },
-    {
-        "id": "2",
-        "amount": 1200,
-        "category": "Rent",
-        "date": "2025-10-05",
-        "note": "Monthly rent payment",
-        "type": "expense"
-    },
-    {
-        "id": "3",
-        "amount": 350,
-        "category": "Groceries",
-        "date": "2025-10-08",
-        "note": "Weekly shopping",
-        "type": "expense"
-    }
-]
+# ---------- DynamoDB Setup ----------
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')  # change region if needed
+transactions_table = dynamodb.Table('Transactions')
+budget_table = dynamodb.Table('Budget')
 
-budget = {
-    "month": "2025-10",
-    "amount": 4000,
-    "spent": 1550
-}
+# ---------- Helper function ----------
+def decimal_to_float(obj):
+    """Convert DynamoDB Decimals to normal float/int for JSON serialization"""
+    if isinstance(obj, list):
+        return [decimal_to_float(i) for i in obj]
+    elif isinstance(obj, dict):
+        return {k: decimal_to_float(v) for k, v in obj.items()}
+    elif isinstance(obj, Decimal):
+        return float(obj)
+    return obj
 
-# -------------------------------
-# ROUTES
-# -------------------------------
+# ---------- Routes ----------
 
 @app.route("/")
 def home():
-    return jsonify({"message": "Finance backend is running!"})
+    return jsonify({"message": "Finance backend connected to DynamoDB!"})
 
-# ---- Transactions ----
+
+# ---- Get all transactions ----
 @app.route("/transactions", methods=["GET"])
 def get_transactions():
-    return jsonify(transactions)
+    response = transactions_table.scan()
+    items = response.get('Items', [])
+    return jsonify(decimal_to_float(items))
 
+
+# ---- Add a transaction ----
 @app.route("/transactions", methods=["POST"])
 def add_transaction():
     data = request.get_json()
     new_tx = {
         "id": str(uuid.uuid4()),
-        "amount": data.get("amount"),
+        "amount": Decimal(str(data.get("amount", 0))),
         "category": data.get("category"),
         "date": data.get("date", datetime.now().strftime("%Y-%m-%d")),
         "note": data.get("note", ""),
         "type": data.get("type", "expense")
     }
-    transactions.append(new_tx)
-    return jsonify(new_tx), 201
+    transactions_table.put_item(Item=new_tx)
+    return jsonify(decimal_to_float(new_tx)), 201
+
 
 # ---- Summary ----
 @app.route("/summary", methods=["GET"])
 def get_summary():
-    total_income = sum(t["amount"] for t in transactions if t["type"] == "income")
-    total_expense = sum(t["amount"] for t in transactions if t["type"] == "expense")
+    response = transactions_table.scan()
+    items = response.get('Items', [])
+
+    total_income = sum(float(t["amount"]) for t in items if t["type"] == "income")
+    total_expense = sum(float(t["amount"]) for t in items if t["type"] == "expense")
     balance = total_income - total_expense
 
     return jsonify({
@@ -80,19 +71,31 @@ def get_summary():
         "balance": balance
     })
 
-# ---- Budget ----
+
+# ---- Get Budget ----
 @app.route("/budget", methods=["GET"])
 def get_budget():
-    return jsonify(budget)
+    # assuming only one budget record per month
+    response = budget_table.scan()
+    items = response.get('Items', [])
+    if not items:
+        return jsonify({"message": "No budget found"}), 404
+    return jsonify(decimal_to_float(items[0]))
 
+
+# ---- Set Budget ----
 @app.route("/budget", methods=["POST"])
 def set_budget():
-    global budget
-    budget = request.get_json()
-    return jsonify(budget)
+    data = request.get_json()
+    budget_item = {
+        "month": data.get("month", datetime.now().strftime("%Y-%m")),
+        "amount": Decimal(str(data.get("amount", 0))),
+        "spent": Decimal(str(data.get("spent", 0)))
+    }
+    budget_table.put_item(Item=budget_item)
+    return jsonify(decimal_to_float(budget_item))
 
-# -------------------------------
-# RUN SERVER
-# -------------------------------
+
+# ---------- Run Server ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)

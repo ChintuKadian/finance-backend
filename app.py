@@ -43,6 +43,7 @@ def get_transactions():
 @app.route("/transactions", methods=["POST"])
 def add_transaction():
     data = request.get_json()
+    print("Received data:", data)
     new_tx = {
         "id": str(uuid.uuid4()),
         "amount": Decimal(str(data.get("amount", 0))),

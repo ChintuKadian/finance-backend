@@ -28,6 +28,5 @@ rsa==4.7.2
 s3transfer==0.14.0
 six==1.17.0
 tzdata==2025.2
-
-
+urllib3==1.26.18
 Werkzeug==3.1.3

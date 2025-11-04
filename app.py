@@ -84,39 +84,56 @@ def get_budget():
         response = budget_table.scan()
         items = response.get('Items', [])
         print(f"✅ [GET /budget] Items fetched: {items}")
+
         if not items:
             return jsonify({"message": "No budget found"}), 404
-        return jsonify(decimal_to_float(items))
+
+        # 🔄 Convert DynamoDB Decimals and rename fields for frontend compatibility
+        formatted_items = []
+        for item in items:
+            formatted_items.append({
+                "month": item.get("month", ""),
+                "amount": float(item.get("budgetLimit", 0)),
+                "spent": float(item.get("spent", 0)),
+                "category": item.get("category", ""),
+                "userId": item.get("userId", "")
+            })
+
+        return jsonify(formatted_items)
+
     except Exception as e:
         print(f"❌ [GET /budget] Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ---- add budgets 
 @app.route("/budget", methods=["POST"])
-def set_budget():
+def add_budget():
     try:
         data = request.get_json()
-        print(f"📩 [POST /budget] Data received: {data}")
+        print("📝 [POST /budget] Received data:", data)
 
-        user_id = data.get("userId", "default_user")
-        month = data.get("month", datetime.now().strftime("%Y-%m"))
-        budget_limit = Decimal(str(data.get("budgetLimit") or data.get("amount", 0)))
-        spent = Decimal(str(data.get("spent", 0)))
-        category = data.get("category", "General")
+        user_id = data.get("userId")
+        month = data.get("month")
+        budget_limit = data.get("budgetLimit")
+        category = data.get("category")
+        spent = data.get("spent", 0)
+
+        if not all([user_id, month, budget_limit, category]):
+            return jsonify({"error": "Missing required fields"}), 400
 
         budget_item = {
             "userId": user_id,
             "month": month,
-            "budgetLimit": budget_limit,
-            "spent": spent,
-            "category": category
+            "category": category,
+            "budgetLimit": Decimal(str(budget_limit)),
+            "spent": Decimal(str(spent))
         }
 
-        print(f"🧾 [POST /budget] Writing item to DynamoDB: {budget_item}")
+        # Save to DynamoDB
         budget_table.put_item(Item=budget_item)
+        print("✅ [POST /budget] Saved successfully:", budget_item)
+        return jsonify({"message": "Budget added successfully", "item": budget_item}), 200
 
-        print("✅ [POST /budget] Budget saved successfully")
-        return jsonify(decimal_to_float(budget_item)), 201
     except Exception as e:
         print(f"❌ [POST /budget] Error: {e}")
         return jsonify({"error": str(e)}), 500

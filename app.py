@@ -3,10 +3,19 @@ from flask_cors import CORS
 from datetime import datetime
 import boto3
 import uuid
+import os
+import re
+from datetime import datetime
 from decimal import Decimal
 
 app = Flask(__name__)
 CORS(app)
+
+#===for upload files setup
+s3 = boto3.client('s3')
+textract = boto3.client("textract")
+BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "finance-tracker-store")
+
 
 # ---------- DynamoDB Setup ----------
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')  # change region if needed
@@ -137,6 +146,89 @@ def add_budget():
     except Exception as e:
         print(f"❌ [POST /budget] Error: {e}")
         return jsonify({"error": str(e)}), 500
+
+#------------upload files
+
+def upload_receipt():
+    try:
+        # 1️⃣ Validate file input
+        if "file" not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+        file = request.files["file"]
+        category = request.form.get("category", "Miscellaneous")
+        user_id = request.form.get("userId", "default_user")
+
+        # 2️⃣ Upload file to S3
+        file_key = f"receipts/{user_id}/{uuid.uuid4()}_{file.filename}"
+        s3.upload_fileobj(file, BUCKET_NAME, file_key)
+        file_url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{file_key}"
+
+        # 3️⃣ Run Textract to extract text
+        textract_response = textract.detect_document_text(
+            Document={"S3Object": {"Bucket": BUCKET_NAME, "Name": file_key}}
+        )
+
+        full_text = " ".join(
+            [block["Text"] for block in textract_response["Blocks"] if block["BlockType"] == "LINE"]
+        ).lower()
+
+        # 4️⃣ Extract amount (looking for "total" or "amount")
+        amount = 0.0
+        amount_match = re.search(r"(total|amount)[^\d]*(\d+[.,]?\d*)", full_text)
+        if amount_match:
+            amount = float(amount_match.group(2).replace(",", ""))
+
+        # 5️⃣ Extract date
+        date = None
+        date_patterns = [
+            r"\b\d{2}[/-]\d{2}[/-]\d{2,4}\b",  # 12/11/2024 or 12-11-2024
+            r"\b\d{4}[/-]\d{2}[/-]\d{2}\b",    # 2024-11-12
+        ]
+        for pattern in date_patterns:
+            match = re.search(pattern, full_text)
+            if match:
+                date = match.group(0)
+                break
+
+        if not date:
+            date = datetime.utcnow().strftime("%Y-%m-%d")
+
+        # 6️⃣ Save in DynamoDB
+        item = {
+            "receiptId": str(uuid.uuid4()),
+            "userId": user_id,
+            "fileName": file.filename,
+            "fileUrl": file_url,
+            "category": category,
+            "amount": Decimal(str(amount)),
+            "date": date,
+            "uploadDate": datetime.utcnow().isoformat(),
+            "rawText": full_text[:500],  # store small snippet of text for reference
+        }
+        RECEIPT_TABLE.put_item(Item=item)
+
+        # 7️⃣ Response
+        return jsonify({
+            "message": "Receipt uploaded and processed successfully",
+            "fileUrl": file_url,
+            "amount": amount,
+            "date": date,
+            "category": category,
+        }), 200
+
+    except Exception as e:
+        print(f"❌ [upload-receipt] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/files', methods=['GET'])
+def list_files():
+    try:
+        response = s3.list_objects_v2(Bucket=BUCKET_NAME)
+        files = [obj['Key'] for obj in response.get('Contents', [])]
+        return jsonify(files)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
 
 # ---------- Run Server ----------
 if __name__ == "__main__":

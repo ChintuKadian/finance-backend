@@ -12,8 +12,8 @@ app = Flask(__name__)
 CORS(app)
 
 #===for upload files setup
-s3 = boto3.client('s3')
-textract = boto3.client("textract")
+s3 = boto3.client("s3", region_name="us-east-1")
+textract = boto3.client("textract", region_name="us-east-1")
 BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "finance-tracker-store")
 
 

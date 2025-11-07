@@ -7,6 +7,12 @@ import os
 import re
 from datetime import datetime
 from decimal import Decimal
+import config 
+
+from werkzeug.utils import secure_filename
+from utils.s3_utils import upload_fileobj_to_s3, make_s3_object_url
+from utils.textract_utils import extract_text_from_s3, parse_amount_and_date_from_text
+from utils.db_utils import insert_transaction
 
 app = Flask(__name__)
 CORS(app)
@@ -14,8 +20,9 @@ CORS(app)
 #===for upload files setup
 s3 = boto3.client("s3", region_name="us-east-1")
 textract = boto3.client("textract", region_name="us-east-1")
-BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "finance-tracker-store")
-
+BUCKET_NAME = "finance-tracker-store"
+S3_BUCKET = os.environ.get("S3_BUCKET")
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "pdf"}
 
 # ---------- DynamoDB Setup ----------
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')  # change region if needed
@@ -148,78 +155,101 @@ def add_budget():
         return jsonify({"error": str(e)}), 500
 
 #------------upload files
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def upload_receipt():
+@app.route("/upload-and-add-transaction", methods=["POST"])
+def upload_and_add_transaction():
+    """
+    Accepts form-data:
+      - file: (required) receipt image/pdf
+      - userId: (required) user identifier
+      - category: (optional) category string
+      - note: (optional) note string
+    Returns created transaction JSON on success.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "file is required"}), 400
+
+    file = request.files["file"]
+    user_id = request.form.get("userId") or request.form.get("user_id")
+    if not user_id:
+        return jsonify({"error": "userId is required"}), 400
+
+    if not file or file.filename == "":
+        return jsonify({"error": "no file selected"}), 400
+
+    if not allowed_file(file.filename):
+        return jsonify({"error": f"file type not allowed. Allowed: {ALLOWED_EXTENSIONS}"}), 400
+
+    filename = secure_filename(file.filename)
+    # generate unique S3 key
+    key = f"receipts/{user_id}/{uuid.uuid4().hex}_{filename}"
+
     try:
-        # 1️⃣ Validate file input
-        if "file" not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
-        file = request.files["file"]
-        category = request.form.get("category", "Miscellaneous")
-        user_id = request.form.get("userId", "default_user")
+        # Upload to S3
+        file.seek(0)
+        upload_fileobj_to_s3(file.stream, S3_BUCKET, key, content_type=file.content_type)
 
-        # 2️⃣ Upload file to S3
-        file_key = f"receipts/{user_id}/{uuid.uuid4()}_{file.filename}"
-        s3.upload_fileobj(file, BUCKET_NAME, file_key)
-        file_url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{file_key}"
+        # Optionally wait a short time if needed; Textract works on S3 objects immediately typically.
+        # Call Textract to extract text from the uploaded S3 object
+        extracted_text = extract_text_from_s3(S3_BUCKET, key)
 
-        # 3️⃣ Run Textract to extract text
-        textract_response = textract.detect_document_text(
-            Document={"S3Object": {"Bucket": BUCKET_NAME, "Name": file_key}}
-        )
+        # Parse amount and date (heuristics + regex)
+        amount, date = parse_amount_and_date_from_text(extracted_text)
 
-        full_text = " ".join(
-            [block["Text"] for block in textract_response["Blocks"] if block["BlockType"] == "LINE"]
-        ).lower()
+        # if amount missing, set to 0.0 so frontend can show it as unknown
+        if amount is None:
+            amount_value = 0.0
+            inferred = False
+        else:
+            amount_value = float(amount)
+            inferred = True
 
-        # 4️⃣ Extract amount (looking for "total" or "amount")
-        amount = 0.0
-        amount_match = re.search(r"(total|amount)[^\d]*(\d+[.,]?\d*)", full_text)
-        if amount_match:
-            amount = float(amount_match.group(2).replace(",", ""))
+        # if date missing, use today's date
+        if date is None:
+            date_value = datetime.date.today().isoformat()
+            date_inferred = False
+        else:
+            # date might be string; convert to ISO
+            if isinstance(date, datetime.date):
+                date_value = date.isoformat()
+            else:
+                date_value = str(date)
+            date_inferred = True
 
-        # 5️⃣ Extract date
-        date = None
-        date_patterns = [
-            r"\b\d{2}[/-]\d{2}[/-]\d{2,4}\b",  # 12/11/2024 or 12-11-2024
-            r"\b\d{4}[/-]\d{2}[/-]\d{2}\b",    # 2024-11-12
-        ]
-        for pattern in date_patterns:
-            match = re.search(pattern, full_text)
-            if match:
-                date = match.group(0)
-                break
+        # Build the transaction item
+        transaction_id = str(uuid.uuid4())
+        category = request.form.get("category", "uncategorized")
+        note = request.form.get("note", "")
+        receipt_url = make_s3_object_url(S3_BUCKET, key)
 
-        if not date:
-            date = datetime.utcnow().strftime("%Y-%m-%d")
-
-        # 6️⃣ Save in DynamoDB
-        item = {
-            "receiptId": str(uuid.uuid4()),
+        transaction_item = {
+            "id": transaction_id,
             "userId": user_id,
-            "fileName": file.filename,
-            "fileUrl": file_url,
+            "amount": amount_value,
             "category": category,
-            "amount": Decimal(str(amount)),
-            "date": date,
-            "uploadDate": datetime.utcnow().isoformat(),
-            "rawText": full_text[:500],  # store small snippet of text for reference
+            "date": date_value,
+            "note": note,
+            "type": "expense" if amount_value >= 0 else "income",  # naive; you might want logic based on sign or UI choice
+            "receiptUrl": receipt_url,
+            "createdAt": datetime.datetime.utcnow().isoformat() + "Z",
+            "inferredFields": {
+                "amountDetected": inferred,
+                "dateDetected": date_inferred
+            }
         }
-        RECEIPT_TABLE.put_item(Item=item)
 
-        # 7️⃣ Response
-        return jsonify({
-            "message": "Receipt uploaded and processed successfully",
-            "fileUrl": file_url,
-            "amount": amount,
-            "date": date,
-            "category": category,
-        }), 200
+        # Insert into DynamoDB Transactions table
+        insert_transaction(TRANSACTIONS_TABLE, transaction_item)
+
+        return jsonify({"transaction": transaction_item}), 201
 
     except Exception as e:
-        print(f"❌ [upload-receipt] Error: {e}")
+        app.logger.exception("Failed to upload and add transaction")
         return jsonify({"error": str(e)}), 500
-    
+
+
 @app.route('/files', methods=['GET'])
 def list_files():
     try:

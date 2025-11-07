@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from decimal import Decimal
 import config 
-
+from typing import Optional
 from werkzeug.utils import secure_filename
 from utils.s3_utils import upload_fileobj_to_s3, make_s3_object_url
 from utils.textract_utils import extract_text_from_s3, parse_amount_and_date_from_text
@@ -158,97 +158,188 @@ def add_budget():
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
+
+def _normalize_amount(form_amount: Optional[str], parsed_amount: Optional[float]) -> (Optional[float], bool):
+    """
+    Returns (amount_value_or_None, was_inferred_bool)
+    - If form_amount is provided and valid, prefer it (inferred=False)
+    - Else if parsed_amount is provided, use it (inferred=True)
+    - Else return (None, False)
+    """
+    if form_amount:
+        try:
+            # Allow commas in input like "1,234.56"
+            cleaned = form_amount.replace(",", "").strip()
+            val = float(cleaned)
+            return val, False
+        except Exception:
+            # invalid user-provided amount — fall back to parsed_amount
+            pass
+
+    if parsed_amount is not None:
+        try:
+            return float(parsed_amount), True
+        except Exception:
+            return None, False
+
+    return None, False
+
+
+def _normalize_date(form_date: Optional[str], parsed_date) -> (Optional[str], bool):
+    """
+    Returns (date_iso_or_None, was_inferred_bool)
+    - If form_date is provided and valid ISO-like, prefer it (inferred=False)
+    - Else if parsed_date is a date object, convert to ISO and return (inferred=True)
+    - Else None
+    """
+    if form_date:
+        fd = form_date.strip()
+        # Try common formats: ISO first, then some slashed formats
+        try:
+            # try direct ISO (YYYY-MM-DD)
+            dt = datetime.date.fromisoformat(fd)
+            return dt.isoformat(), False
+        except Exception:
+            # try dd/mm/yyyy or dd-mm-yyyy
+            for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%m/%d/%Y"):
+                try:
+                    dt = datetime.datetime.strptime(fd, fmt).date()
+                    return dt.isoformat(), False
+                except Exception:
+                    continue
+            # If not parseable, ignore and fallback to parsed_date
+    if parsed_date:
+        # parsed_date may be a datetime.date already (from textract_utils)
+        if isinstance(parsed_date, (datetime.date, datetime.datetime)):
+            return parsed_date.isoformat(), True
+        else:
+            # if parsed_date is string, try to normalize
+            try:
+                # try parse as ISO first
+                dt = datetime.date.fromisoformat(str(parsed_date))
+                return dt.isoformat(), True
+            except Exception:
+                pass
+    return None, False
+
+
 @app.route("/upload-and-add-transaction", methods=["POST"])
 def upload_and_add_transaction():
     """
     Accepts form-data:
-      - file: (required) receipt image/pdf
+      - file: (required) receipt image or pdf
       - userId: (required) user identifier
       - category: (optional) category string
       - note: (optional) note string
-    Returns created transaction JSON on success.
+      - amount: (optional) numeric override (string allowed)
+      - date: (optional) date override (string allowed)
+    Behavior:
+      - Upload file to S3
+      - Call Textract (detect_document_text) to extract text
+      - Parse amount & date from Textract output (fallback heuristics)
+      - If frontend provided amount/date and they are valid, prefer them
+      - Insert transaction into DynamoDB and return the created item JSON
     """
+    # Basic validations
     if "file" not in request.files:
         return jsonify({"error": "file is required"}), 400
 
     file = request.files["file"]
-    user_id = request.form.get("userId") or request.form.get("user_id")
-    if not user_id:
-        return jsonify({"error": "userId is required"}), 400
-
     if not file or file.filename == "":
         return jsonify({"error": "no file selected"}), 400
 
     if not allowed_file(file.filename):
         return jsonify({"error": f"file type not allowed. Allowed: {ALLOWED_EXTENSIONS}"}), 400
 
+    user_id = request.form.get("userId") or request.form.get("user_id")
+    if not user_id:
+        return jsonify({"error": "userId is required"}), 400
+
     filename = secure_filename(file.filename)
-    # generate unique S3 key
     key = f"receipts/{user_id}/{uuid.uuid4().hex}_{filename}"
+
+    # read optional overrides from client
+    form_amount = request.form.get("amount")  # may be None
+    form_date = request.form.get("date")      # may be None
+    category = request.form.get("category", "uncategorized")
+    note = request.form.get("note", "")
 
     try:
         # Upload to S3
         file.seek(0)
         upload_fileobj_to_s3(file.stream, S3_BUCKET, key, content_type=file.content_type)
 
-        # Optionally wait a short time if needed; Textract works on S3 objects immediately typically.
-        # Call Textract to extract text from the uploaded S3 object
+        # Extract text from S3 via Textract
         extracted_text = extract_text_from_s3(S3_BUCKET, key)
 
-        # Parse amount and date (heuristics + regex)
-        amount, date = parse_amount_and_date_from_text(extracted_text)
+        # Parse amount+date from extracted text (heuristic)
+        parsed_amount, parsed_date = parse_amount_and_date_from_text(extracted_text)
 
-        # if amount missing, set to 0.0 so frontend can show it as unknown
-        if amount is None:
+        # Prefer client overrides if valid; otherwise use parsed values
+        amount_value, amount_inferred = _normalize_amount(form_amount, parsed_amount)
+        date_value, date_inferred = _normalize_date(form_date, parsed_date)
+
+        # Final fallback defaults
+        if amount_value is None:
+            # If no amount from either source, set to 0.0 but mark as not detected/inferred = False
             amount_value = 0.0
-            inferred = False
-        else:
-            amount_value = float(amount)
-            inferred = True
+            amount_inferred = False
 
-        # if date missing, use today's date
-        if date is None:
+        if date_value is None:
+            # default to today's date
             date_value = datetime.date.today().isoformat()
             date_inferred = False
         else:
-            # date might be string; convert to ISO
-            if isinstance(date, datetime.date):
-                date_value = date.isoformat()
-            else:
-                date_value = str(date)
-            date_inferred = True
+            date_inferred = date_inferred
 
-        # Build the transaction item
+        # Build transaction item
         transaction_id = str(uuid.uuid4())
-        category = request.form.get("category", "uncategorized")
-        note = request.form.get("note", "")
         receipt_url = make_s3_object_url(S3_BUCKET, key)
+
+        # naive type assignment: if amount > 0 treat as expense, else income (adjust as needed)
+        tx_type = "expense" if float(amount_value) >= 0 else "income"
 
         transaction_item = {
             "id": transaction_id,
             "userId": user_id,
-            "amount": amount_value,
+            "amount": float(amount_value),
             "category": category,
             "date": date_value,
             "note": note,
-            "type": "expense" if amount_value >= 0 else "income",  # naive; you might want logic based on sign or UI choice
+            "type": tx_type,
             "receiptUrl": receipt_url,
             "createdAt": datetime.datetime.utcnow().isoformat() + "Z",
             "inferredFields": {
-                "amountDetected": inferred,
-                "dateDetected": date_inferred
-            }
+                "amountDetected": bool(parsed_amount is not None),
+                "dateDetected": bool(parsed_date is not None),
+                "amountOverriddenByUser": bool(form_amount is not None),
+                "dateOverriddenByUser": bool(form_date is not None),
+                "finalAmountInferred": bool(amount_inferred),
+                "finalDateInferred": bool(date_inferred),
+            },
+            # optionally save the raw extracted_text for debugging (comment out in prod)
+            # "rawExtractedText": extracted_text
         }
 
-        # Insert into DynamoDB Transactions table
+        # Insert into DynamoDB
         insert_transaction(TRANSACTIONS_TABLE, transaction_item)
 
         return jsonify({"transaction": transaction_item}), 201
 
-    except Exception as e:
+    except Exception as exc:
         app.logger.exception("Failed to upload and add transaction")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(exc)}), 500
 
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "timestamp": datetime.datetime.utcnow().isoformat() + "Z"}), 200
+
+
+if __name__ == "__main__":
+    host = getattr(config, "HOST", "0.0.0.0")
+    port = int(getattr(config, "PORT", 5000))
+    app.run(host=host, port=port, debug=True)
 
 @app.route('/files', methods=['GET'])
 def list_files():

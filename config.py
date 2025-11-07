@@ -26,3 +26,13 @@ PORT = int(os.environ.get("PORT", PORT))
 AWS_REGION = os.environ.get("AWS_REGION", AWS_REGION)
 S3_BUCKET = os.environ.get("S3_BUCKET", S3_BUCKET)
 TRANSACTIONS_TABLE = os.environ.get("TRANSACTIONS_TABLE", TRANSACTIONS_TABLE)
+
+# --- Optional (NOT RECOMMENDED): Hardcoded AWS credentials (ONLY if absolutely necessary)
+# If your EC2 instance already has an IAM role with permissions, leave these None.
+# If you must hardcode for local testing (not recommended), set values and ensure config.py is .gitignored.
+AWS_ACCESS_KEY_ID = None
+AWS_SECRET_ACCESS_KEY = None
+AWS_SESSION_TOKEN = None  # optional
+# Example:
+# AWS_ACCESS_KEY_ID = "AKIA..."
+# AWS_SECRET_ACCESS_KEY = "xxxx"

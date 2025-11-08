@@ -18,7 +18,9 @@ import config
 
 app = Flask(__name__)
 CORS(app)
-
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+s3 = boto3.client('s3', region_name='us-east-1')
+transactions_table = dynamodb.Table('Transactions')
 # ---------- Config / Table names ----------
 AWS_REGION = getattr(config, "AWS_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 TRANSACTIONS_TABLE = getattr(config, "TRANSACTIONS_TABLE", "Transactions")
@@ -286,8 +288,7 @@ def get_budget():
         # Scan all transactions
         transactions_table = dynamodb.Table(TRANSACTIONS_TABLE)
         response = transactions_table.scan(
-            ProjectionExpression="amount , type",
-            FilterExpression=Attr("type").eq("expense")
+            ProjectionExpression="amount"
             )
         items = response.get("Items", [])
 
@@ -320,103 +321,34 @@ def get_budget():
 
 
 # ---------- Upload endpoint (uses the inline helpers above) ----------
-@app.route("/upload-and-add-transaction", methods=["POST"])
-def upload_and_add_transaction():
-    if "file" not in request.files:
-        return jsonify({"error": "file is required"}), 400
-    file = request.files["file"]
-    if not file or file.filename == "":
-        return jsonify({"error": "no file selected"}), 400
-    if not allowed_file(file.filename):
-        return jsonify({"error": f"file type not allowed. Allowed: {ALLOWED_EXTENSIONS}"}), 400
 
-    user_id = request.form.get("userId") or request.form.get("user_id")
-    if not user_id:
-        return jsonify({"error": "userId is required"}), 400
 
-    filename = secure_filename(file.filename)
-    key = f"receipts/{user_id}/{uuid.uuid4().hex}_{filename}"
-
-    form_amount = request.form.get("amount")
-    form_date = request.form.get("date")
-    category = request.form.get("category", "uncategorized")
-    note = request.form.get("note", "")
-
+@app.route('/export-data', methods=['GET'])
+def export_data_to_s3():
     try:
-        # Upload to S3
-        file.seek(0)
-        upload_fileobj_to_s3(file, BUCKET_NAME, key, content_type=file.content_type)
+        # 1️⃣ Get all transactions
+        response = transactions_table.scan()
+        items = response.get('Items', [])
 
-        # Textract
-        extracted_text = extract_text_from_s3(BUCKET_NAME, key)
-        parsed_amount, parsed_date = parse_amount_and_date_from_text(extracted_text)
+        # 2️⃣ Convert to JSON
+        data = json.dumps(items, indent=2)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"transactions_{timestamp}.json"
 
-        # choose final amount/date
-        amount_value = None
-        date_value = None
-        try:
-            if form_amount:
-                amount_value = float(form_amount.replace(",", ""))
-            elif parsed_amount is not None:
-                amount_value = float(parsed_amount)
-            else:
-                amount_value = 0.0
-        except:
-            amount_value = 0.0
+        # 3️⃣ Upload to S3
+        s3.put_object(
+            Bucket='finance-app-exports',
+            Key=filename,
+            Body=data
+        )
 
-        # parse date
-        if form_date:
-            date_value = form_date
-        elif parsed_date:
-            date_value = parsed_date
-        else:
-            date_value = datetime.date.today().isoformat()
-
-        # build transaction item
-        transaction_id = str(uuid.uuid4())
-        receipt_url = make_s3_object_url(BUCKET_NAME, key)
-        tx_item = {
-            "id": transaction_id,
-            "transactionId": transaction_id,
-            "userId": user_id,
-            "amount": amount_value,
-            "category": category,
-            "date": date_value,
-            "note": note,
-            "type": "expense" if float(amount_value) >= 0 else "income",
-            "receiptUrl": receipt_url,
-            "createdAt": datetime.datetime.utcnow().isoformat() + "Z",
-        }
-
-        # insert into transactions table
-        insert_transaction(TRANSACTIONS_TABLE, tx_item)
-
-        return jsonify({"transaction": decimal_to_float(tx_item)}), 201
-    except Exception as exc:
-        app.logger.exception("Failed to upload and add transaction")
-        return jsonify({"error": str(exc)}), 500
-
-@app.route("/export-data", methods=["GET"])
-def export_data():
-    import csv, io, boto3
-    from datetime import datetime
-
-    s3 = boto3.client("s3")
-    transactions_table = dynamodb.Table("Transactions")
-    response = transactions_table.scan()
-    items = response.get("Items", [])
-
-    csv_buffer = io.StringIO()
-    writer = csv.DictWriter(csv_buffer, fieldnames=items[0].keys() if items else [])
-    writer.writeheader()
-    writer.writerows(items)
-
-    filename = f"transactions_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    s3.put_object(Bucket="finance-tracker-store", Key=filename, Body=csv_buffer.getvalue())
-    s3_url = f"https://finance-tracker-store.s3.amazonaws.com/{filename}"
-
-    return {"message": "Export successful", "s3_url": s3_url}
-
+        return jsonify({
+            "message": "✅ Transactions exported successfully!",
+            "file": f"s3://finance-app-exports/{filename}",
+            "count": len(items)
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 

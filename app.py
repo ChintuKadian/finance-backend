@@ -250,52 +250,57 @@ def _to_float_safe(v):
         return float(v)
     except Exception:
         return 0.0
+#----------for ses
+def send_budget_alert_email(current_spent, budget):
+    ses = boto3.client("ses", region_name="us-east-1")
+
+    sender = "chintukadian588@gmail.com"       # ✅ verified email
+    recipient = "chintukadian588@gmail.com"    # ✅ can be same or another verified
+    subject = "⚠️ Budget Limit Exceeded!"
+    body_text = (
+        f"Hi there,\n\n"
+        f"Your total spending this month has reached ₹{current_spent}, "
+        f"which exceeds your set budget of ₹{budget}.\n\n"
+        f"Please review your expenses in the Finance Tracker.\n\n"
+        f"— Your Finance App"
+    )
+
+    try:
+        response = ses.send_email(
+            Source=sender,
+            Destination={"ToAddresses": [recipient]},
+            Message={
+                "Subject": {"Data": subject},
+                "Body": {"Text": {"Data": body_text}}
+            }
+        )
+        print("✅ Budget alert email sent! Message ID:", response["MessageId"])
+    except ClientError as e:
+        print("❌ SES Error:", e.response["Error"]["Message"])
 
 
 
 # ---------- Budget endpoints (inline) ----------
 
-current_budget = {"budgetLimit": 5000.0}
-
-# ----------------------------
-# 🟢 POST /budget → set budget
-# ----------------------------
-@app.route("/budget", methods=["POST"])
-def set_budget():
-    try:
-        data = request.get_json()
-        budget_limit = float(data.get("budgetLimit", 0))
-        global current_budget
-        current_budget["budgetLimit"] = budget_limit
-
-        print(f"✅ Budget updated to: {budget_limit}")
-        return jsonify({
-            "message": "Budget updated successfully",
-            "budgetLimit": budget_limit
-        }), 200
-    except Exception as e:
-        print(f"❌ [POST /budget] Error: {e}")
-        return jsonify({"error": str(e)}), 500
+current_budget = {"budgetLimit": 5000}
 
 
-# ----------------------------
-# 🟢 GET /budget → get budget + spent
-# ----------------------------
 @app.route("/budget", methods=["GET"])
 def get_budget():
+    """
+    Fetches all transactions from DynamoDB,
+    sums the total amount spent, and calculates remaining budget.
+    """
     try:
         print("🔍 Fetching all transactions to calculate total spent...")
 
-        # Scan all transactions
         transactions_table = dynamodb.Table(TRANSACTIONS_TABLE)
-        response = transactions_table.scan(
-            ProjectionExpression="amount"
-            )
+        response = transactions_table.scan(ProjectionExpression="amount")
         items = response.get("Items", [])
 
         total_spent = sum(float(item.get("amount", 0)) for item in items)
 
-        # Handle pagination
+        # ✅ Handle pagination
         while "LastEvaluatedKey" in response:
             response = transactions_table.scan(
                 ProjectionExpression="amount",
@@ -305,12 +310,14 @@ def get_budget():
 
         print(f"✅ Total spent: {total_spent}")
 
-        # Get stored budget (default = ₹5000)
+        # ✅ Current budget and remaining balance
         budget_limit = float(current_budget.get("budgetLimit", 5000))
         remaining = budget_limit - total_spent
-
+        if remaining < 0 :
+            print("⚠️ Spent exceeds budget — sending alert email...")
+            send_budget_alert_email(total_spent, budget_limit)
         return jsonify({
-            "month": "2025-11",  # Fixed month
+            "month": "2025-11",
             "budgetLimit": budget_limit,
             "spent": total_spent,
             "remaining": remaining
@@ -318,6 +325,30 @@ def get_budget():
 
     except Exception as e:
         print(f"❌ [GET /budget] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/budget", methods=["POST"])
+def update_budget():
+    """
+    Updates the current budget value (sent from frontend).
+    """
+    try:
+        data = request.get_json()
+        new_limit = float(data.get("budgetLimit", 5000))
+
+        # ✅ Update in-memory budget
+        current_budget["budgetLimit"] = new_limit
+
+        print(f"✅ Budget updated to: {new_limit}")
+
+        return jsonify({
+            "message": "✅ Budget updated successfully",
+            "budgetLimit": new_limit
+        }), 200
+
+    except Exception as e:
+        print(f"❌ [POST /budget] Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -334,27 +365,27 @@ def export_data_to_s3():
         transactions_table = dynamodb.Table("Transactions")  # ⚠️ Change if your table name differs
 
         # 1️⃣ Fetch all transactions
-        print("📥 Fetching data from DynamoDB...")
+        # print("📥 Fetching data from DynamoDB...")
         response = transactions_table.scan()
         items = response.get("Items", [])
-        print(f"✅ Retrieved {len(items)} transactions from DynamoDB.")
+        # print(f"✅ Retrieved {len(items)} transactions from DynamoDB.")
 
         # Handle pagination if there are more items
         while "LastEvaluatedKey" in response:
             response = transactions_table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
             items.extend(response.get("Items", []))
-            print(f"📄 Retrieved additional {len(response.get('Items', []))} items... Total now: {len(items)}")
+            # print(f"📄 Retrieved additional {len(response.get('Items', []))} items... Total now: {len(items)}")
 
         # 2️⃣ Convert to JSON
-        print("🔄 Converting items to JSON format...")
+        # print("🔄 Converting items to JSON format...")
         json_data = json.dumps(items, indent=2, default=str)
-        print("✅ JSON conversion successful. Sample preview:")
+        # print("✅ JSON conversion successful. Sample preview:")
         print(json_data[:300] + "..." if len(json_data) > 300 else json_data)
 
         # 3️⃣ Upload to S3
         bucket_name = "finance-app-exports"  # ⚠️ Replace with your actual S3 bucket name
         file_name = "transactions_export.json"
-        print(f"🚀 Uploading data to S3 bucket: {bucket_name} as {file_name} ...")
+        # print(f"🚀 Uploading data to S3 bucket: {bucket_name} as {file_name} ...")
 
         s3.put_object(
             Bucket=bucket_name,
@@ -363,14 +394,14 @@ def export_data_to_s3():
             ContentType="application/json"
         )
 
-        print("✅ Successfully uploaded transactions_export.json to S3.")
+        # print("✅ Successfully uploaded transactions_export.json to S3.")
         return jsonify({"message": "Data exported successfully to S3", "total_items": len(items)}), 200
 
     except ClientError as e:
-        print("❌ AWS ClientError:", e)
+        # print("❌ AWS ClientError:", e)
         return jsonify({"error": str(e)}), 500
     except Exception as e:
-        print("❌ Unexpected Error:", e)
+        # print("❌ Unexpected Error:", e)
         return jsonify({"error": str(e)}), 500
 
 

@@ -2,6 +2,7 @@
 import os
 import re
 import uuid
+import json
 import datetime
 from decimal import Decimal
 from typing import Optional, Tuple
@@ -322,34 +323,55 @@ def get_budget():
 
 # ---------- Upload endpoint (uses the inline helpers above) ----------
 
-
-@app.route('/export-data', methods=['GET'])
+@app.route("/export-data", methods=["GET"])
 def export_data_to_s3():
     try:
-        # 1️⃣ Get all transactions
+        print("🟢 Starting export process...")
+
+        # Initialize S3 and DynamoDB
+        s3 = boto3.client("s3", region_name="us-east-1")
+        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+        transactions_table = dynamodb.Table("Transactions")  # ⚠️ Change if your table name differs
+
+        # 1️⃣ Fetch all transactions
+        print("📥 Fetching data from DynamoDB...")
         response = transactions_table.scan()
-        items = response.get('Items', [])
+        items = response.get("Items", [])
+        print(f"✅ Retrieved {len(items)} transactions from DynamoDB.")
+
+        # Handle pagination if there are more items
+        while "LastEvaluatedKey" in response:
+            response = transactions_table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            items.extend(response.get("Items", []))
+            print(f"📄 Retrieved additional {len(response.get('Items', []))} items... Total now: {len(items)}")
 
         # 2️⃣ Convert to JSON
-        data = json.dumps(items, indent=2)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"transactions_{timestamp}.json"
+        print("🔄 Converting items to JSON format...")
+        json_data = json.dumps(items, indent=2, default=str)
+        print("✅ JSON conversion successful. Sample preview:")
+        print(json_data[:300] + "..." if len(json_data) > 300 else json_data)
 
         # 3️⃣ Upload to S3
+        bucket_name = "your-bucket-name-here"  # ⚠️ Replace with your actual S3 bucket name
+        file_name = "transactions_export.json"
+        print(f"🚀 Uploading data to S3 bucket: {bucket_name} as {file_name} ...")
+
         s3.put_object(
-            Bucket='finance-app-exports',
-            Key=filename,
-            Body=data
+            Bucket=bucket_name,
+            Key=file_name,
+            Body=json_data,
+            ContentType="application/json"
         )
 
-        return jsonify({
-            "message": "✅ Transactions exported successfully!",
-            "file": f"s3://finance-app-exports/{filename}",
-            "count": len(items)
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print("✅ Successfully uploaded transactions_export.json to S3.")
+        return jsonify({"message": "Data exported successfully to S3", "total_items": len(items)}), 200
 
+    except ClientError as e:
+        print("❌ AWS ClientError:", e)
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        print("❌ Unexpected Error:", e)
+        return jsonify({"error": str(e)}), 500
 
 
 

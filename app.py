@@ -235,107 +235,132 @@ def get_summary():
         app.logger.exception("Failed to compute summary")
         return jsonify({"error": str(e)}), 500
 
-
-# ---------- Budget endpoints (inline) ----------
 def _to_float_safe(v):
     try:
         return float(v)
     except Exception:
         return 0.0
 
-
+#----------helper function
 def _sum_transactions_for_user_month(user_id: str, month_prefix: str) -> float:
     """
-    Sum amounts for transactions of user_id where date starts with month_prefix (YYYY-MM).
-    Tries to use a GSI 'userId-date-index' first; otherwise scans.
+    Sum up 'amount' from Transactions table for a user and month.
+    Supports both GSI query and fallback scan.
     """
-    table = dynamodb.Table(TRANSACTIONS_TABLE)
-    index_name = "userId-date-index"
     try:
-        resp = table.query(
-            IndexName=index_name,
-            KeyConditionExpression=Key("userId").eq(user_id) & Key("date").begins_with(month_prefix),
-            ProjectionExpression="amount",
-        )
-        total = sum(_to_float_safe(item.get("amount", 0)) for item in resp.get("Items", []))
-        while "LastEvaluatedKey" in resp:
+        table = dynamodb.Table(TRANSACTIONS_TABLE)
+        index_name = "userId-date-index"
+        total = 0.0
+
+        # 🟢 Try using GSI if available
+        try:
             resp = table.query(
                 IndexName=index_name,
                 KeyConditionExpression=Key("userId").eq(user_id) & Key("date").begins_with(month_prefix),
                 ProjectionExpression="amount",
-                ExclusiveStartKey=resp["LastEvaluatedKey"],
             )
-            total += sum(_to_float_safe(item.get("amount", 0)) for item in resp.get("Items", []))
-        return total
-    except ClientError:
-        pass
-    except Exception:
-        pass
+            total += sum(_to_float_safe(i.get("amount", 0)) for i in resp.get("Items", []))
+            while "LastEvaluatedKey" in resp:
+                resp = table.query(
+                    IndexName=index_name,
+                    KeyConditionExpression=Key("userId").eq(user_id) & Key("date").begins_with(month_prefix),
+                    ProjectionExpression="amount",
+                    ExclusiveStartKey=resp["LastEvaluatedKey"],
+                )
+                total += sum(_to_float_safe(i.get("amount", 0)) for i in resp.get("Items", []))
+            return total
 
-    # fallback scan
-    total = 0.0
-    scan_kwargs = {
-        "FilterExpression": Attr("userId").eq(user_id) & Attr("date").begins_with(month_prefix),
-        "ProjectionExpression": "amount",
-        "Limit": 1000,
-    }
-    resp = table.scan(**scan_kwargs)
-    total += sum(_to_float_safe(item.get("amount", 0)) for item in resp.get("Items", []))
-    while "LastEvaluatedKey" in resp:
-        scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        except ClientError:
+            pass  # fallback if index doesn't exist
+
+        # 🔵 Fallback to scan
+        scan_kwargs = {
+            "FilterExpression": Attr("userId").eq(user_id) & Attr("date").begins_with(month_prefix),
+            "ProjectionExpression": "amount",
+        }
         resp = table.scan(**scan_kwargs)
-        total += sum(_to_float_safe(item.get("amount", 0)) for item in resp.get("Items", []))
-    return total
+        total += sum(_to_float_safe(i.get("amount", 0)) for i in resp.get("Items", []))
+        while "LastEvaluatedKey" in resp:
+            scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+            resp = table.scan(**scan_kwargs)
+            total += sum(_to_float_safe(i.get("amount", 0)) for i in resp.get("Items", []))
+        return total
 
-
+    except Exception as e:
+        print(f"❌ Error computing total spent: {e}")
+        return 0.0
+# ---------- Budget endpoints (inline) ----------
 @app.route("/budget", methods=["GET"])
 def get_budget_route():
+    """
+    Fetch the user's budget and spending for the given month.
+    Dynamically calculates spent total from Transactions table.
+    """
     user_id = request.args.get("userId")
     month = request.args.get("month") or datetime.date.today().strftime("%Y-%m")
+
     if not user_id:
         return jsonify({"error": "userId is required"}), 400
+
     try:
-        budget_item = None
+        # 🟢 Try to get item by key (preferred)
         try:
             resp = budgets_table.get_item(Key={"userId": user_id, "month": month})
             budget_item = resp.get("Item")
         except ClientError:
+            app.logger.warning("⚠️ get_item failed; falling back to scan()")
+            budget_item = None
+
+        # 🔵 If get_item fails or no item found, scan with reserved word fix
+        if not budget_item:
             scan_resp = budgets_table.scan(
                 FilterExpression=Attr("userId").eq(user_id) & Attr("month").eq(month),
-                ProjectionExpression="userId, month, budgetLimit, updatedAt",
+                ProjectionExpression="#u, #m, budgetLimit, updatedAt",
+                ExpressionAttributeNames={
+                    "#u": "userId",
+                    "#m": "month",
+                },
             )
             items = scan_resp.get("Items", [])
             budget_item = items[0] if items else None
 
-        budget_limit = _to_float_safe(budget_item.get("budgetLimit")) if budget_item and budget_item.get("budgetLimit") is not None else 0.0
+        # 🧮 Compute budget/spent/remaining
+        budget_limit = float(budget_item.get("budgetLimit", 0.0)) if budget_item else 0.0
         spent = _sum_transactions_for_user_month(user_id, month)
         remaining = budget_limit - spent
+
         return jsonify({
             "userId": user_id,
             "month": month,
             "budgetLimit": budget_limit,
             "spent": spent,
             "remaining": remaining,
-            "budgetItem": decimal_to_float(budget_item) if budget_item else None,
+            "budgetItem": budget_item or {},
         }), 200
+
     except Exception as exc:
-        app.logger.exception("Failed to fetch budget")
+        app.logger.exception("❌ Failed to fetch budget")
         return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/budget", methods=["POST"])
 def post_budget_route():
+    """
+    Create or update the user's monthly budget.
+    """
     try:
         data = request.get_json() or {}
         user_id = data.get("userId")
         budget_limit = data.get("budgetLimit") if "budgetLimit" in data else data.get("amount")
         month = data.get("month") or datetime.date.today().strftime("%Y-%m")
         category = data.get("category")
+
         if not user_id:
             return jsonify({"error": "userId is required"}), 400
         if budget_limit is None:
             return jsonify({"error": "budgetLimit is required"}), 400
 
+        # 🟢 Save to DynamoDB
         item = {
             "userId": user_id,
             "month": month,
@@ -344,16 +369,28 @@ def post_budget_route():
         }
         if category:
             item["category"] = category
+
         budgets_table.put_item(Item=item)
 
+        # 🧮 Compute current totals
         spent = _sum_transactions_for_user_month(user_id, month)
         remaining = float(item["budgetLimit"]) - spent
-        item["budgetLimit"] = float(item["budgetLimit"])  # convert for json
-        return jsonify({"budget": decimal_to_float(item), "spent": spent, "remaining": remaining}), 201
-    except Exception as exc:
-        app.logger.exception("Failed to upsert budget")
-        return jsonify({"error": str(exc)}), 500
 
+        # 🟢 Return as clean JSON
+        return jsonify({
+            "budget": {
+                "userId": user_id,
+                "month": month,
+                "budgetLimit": float(item["budgetLimit"]),
+                "updatedAt": item["updatedAt"],
+            },
+            "spent": spent,
+            "remaining": remaining,
+        }), 201
+
+    except Exception as exc:
+        app.logger.exception("❌ Failed to create/update budget")
+        return jsonify({"error": str(exc)}), 500
 
 # ---------- Upload endpoint (uses the inline helpers above) ----------
 @app.route("/upload-and-add-transaction", methods=["POST"])

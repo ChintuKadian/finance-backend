@@ -285,90 +285,39 @@ def send_budget_alert_email(current_spent, budget):
 current_budget = {"budgetLimit": 5000}
 
 
-@app.route("/get-budget", methods=["GET"])
-def get_budget():
-    try:
-        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
-        transactions_table = dynamodb.Table("Transactions")
-
-        # get all transactions
-        response = transactions_table.scan()
-        items = response.get("Items", [])
-
-        # sum all expense type transactions
-        total_spent = sum(float(txn["amount"]) for txn in items if txn["type"] == "expense")
-
-        budget = 5000  # fixed budget
-        print(f"💰 Total spent: {total_spent}, Budget: {budget}")
-
-        # check and send alert
-        if total_spent > budget:
-            print("⚠️ Spending over limit — sending alert...")
-            send_budget_alert_email(total_spent, budget)
-
-        return jsonify({
-            "month": "November",
-            "amount": budget,
-            "spent": total_spent
-        })
-
-    except Exception as e:
-        print("❌ Error:", e)
-        return jsonify({"error": str(e)}), 500
-
-current_budget = {"month": "November", "amount": 5000}
-
-@app.route("/budget", methods=["POST"])
+@app.route("/budget", methods=["GET", "POST"])
 def set_and_get_budget():
     global current_budget
 
     try:
-        data = request.get_json() or {}
-        print("📩 Received budget data:", data)
+        if request.method == "POST":
+            data = request.get_json() or {}
+            print("📩 Received budget data:", data)
+            if "amount" in data:
+                current_budget["amount"] = float(data["amount"])
+            if "month" in data:
+                current_budget["month"] = data["month"]
+            print(f"✅ Updated budget: {current_budget}")
 
-        # 1️⃣ Update budget if provided
-        if "amount" in data:
-            current_budget["amount"] = float(data["amount"])
-        if "month" in data:
-            current_budget["month"] = data["month"]
-
-        print(f"✅ Updated budget: {current_budget}")
-
-        # 2️⃣ Fetch transactions from DynamoDB
+        # Same code for scanning transactions
         dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
         transactions_table = dynamodb.Table("Transactions")
-
-        print("📥 Fetching all transactions from DynamoDB...")
         response = transactions_table.scan()
         items = response.get("Items", [])
-        print(f"✅ Retrieved {len(items)} transactions")
+        total_spent = sum(float(item.get("amount", 0)) for item in items if item.get("type") == "expense")
 
-        # 3️⃣ Calculate total spent (sum of all expense transactions)
-        total_spent = sum(
-            float(item.get("amount", 0))
-            for item in items
-            if item.get("type") == "expense"
-        )
-
-        print(f"💰 Total spent: {total_spent}, Budget: {current_budget['amount']}")
-
-        # 4️⃣ If overspending, send SES alert
         if total_spent > current_budget["amount"]:
             print("⚠️ Overspending detected — sending SES alert...")
             send_budget_alert_email(total_spent, current_budget["amount"])
 
-        # 5️⃣ Return current budget + spent
         return jsonify({
             "month": current_budget["month"],
             "amount": current_budget["amount"],
             "spent": total_spent
         }), 200
 
-    except ClientError as e:
-        print("❌ AWS ClientError:", e)
-        return jsonify({"error": str(e)}), 500
     except Exception as e:
-        print("❌ Unexpected Error:", e)
+        print("❌ Error:", e)
         return jsonify({"error": str(e)}), 500
 
 # ---------- Upload endpoint (uses the inline helpers above) ----------

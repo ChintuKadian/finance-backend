@@ -286,7 +286,8 @@ def send_budget_alert_email(current_spent, budget):
 # 🔹 Store current budget in memory (acts like a temporary DB)
 current_budget = {
     "amount": 5000,  # default value
-    "month": datetime.now().strftime("%Y-%m")
+    "month": datetime.now().strftime("%Y-%m"),
+    "alert_sent": False
 }
 
 
@@ -317,6 +318,7 @@ def handle_budget():
             current_budget["amount"] = amount
             current_budget["month"] = datetime.now().strftime("%Y-%m")
 
+            
             print(f"✅ Budget updated successfully: {current_budget}")
             return jsonify({
                 "message": "Budget updated successfully",
@@ -336,6 +338,11 @@ def handle_budget():
         )
 
         print(f"💰 Total spent = {total_spent}, Budget = {current_budget['amount']}")
+        if total_spent > current_budget["amount"]:
+            if not current_budget.get("alert_sent"):  # only send once per budget cycle
+                send_budget_alert_email(total_spent, current_budget["amount"])
+                current_budget["alert_sent"] = True
+        
 
         return jsonify({
             "month": current_budget["month"],
@@ -346,6 +353,8 @@ def handle_budget():
     except Exception as e:
         print("❌ Error in /budget:", e)
         return jsonify({"error": str(e)}), 500
+
+
 
 # ---------- Upload endpoint (uses the inline helpers above) ----------
 

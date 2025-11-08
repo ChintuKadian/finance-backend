@@ -285,72 +285,91 @@ def send_budget_alert_email(current_spent, budget):
 current_budget = {"budgetLimit": 5000}
 
 
-@app.route("/budget", methods=["GET"])
+@app.route("/get-budget", methods=["GET"])
 def get_budget():
-    """
-    Fetches all transactions from DynamoDB,
-    sums the total amount spent, and calculates remaining budget.
-    """
     try:
-        print("🔍 Fetching all transactions to calculate total spent...")
+        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+        transactions_table = dynamodb.Table("Transactions")
 
-        transactions_table = dynamodb.Table(TRANSACTIONS_TABLE)
-        response = transactions_table.scan(ProjectionExpression="amount")
+        # get all transactions
+        response = transactions_table.scan()
         items = response.get("Items", [])
 
-        total_spent = sum(float(item.get("amount", 0)) for item in items)
+        # sum all expense type transactions
+        total_spent = sum(float(txn["amount"]) for txn in items if txn["type"] == "expense")
 
-        # ✅ Handle pagination
-        while "LastEvaluatedKey" in response:
-            response = transactions_table.scan(
-                ProjectionExpression="amount",
-                ExclusiveStartKey=response["LastEvaluatedKey"]
-            )
-            total_spent += sum(float(item.get("amount", 0)) for item in response.get("Items", []))
+        budget = 5000  # fixed budget
+        print(f"💰 Total spent: {total_spent}, Budget: {budget}")
 
-        print(f"✅ Total spent: {total_spent}")
+        # check and send alert
+        if total_spent > budget:
+            print("⚠️ Spending over limit — sending alert...")
+            send_budget_alert_email(total_spent, budget)
 
-        # ✅ Current budget and remaining balance
-        budget_limit = float(current_budget.get("budgetLimit", 5000))
-        remaining = budget_limit - total_spent
-        if remaining < 0 :
-            print("⚠️ Spent exceeds budget — sending alert email...")
-            send_budget_alert_email(total_spent, budget_limit)
         return jsonify({
-            "month": "2025-11",
-            "budgetLimit": budget_limit,
-            "spent": total_spent,
-            "remaining": remaining
-        }), 200
+            "month": "November",
+            "amount": budget,
+            "spent": total_spent
+        })
 
     except Exception as e:
-        print(f"❌ [GET /budget] Error: {e}")
+        print("❌ Error:", e)
         return jsonify({"error": str(e)}), 500
 
+current_budget = {"month": "November", "amount": 5000}
 
 @app.route("/budget", methods=["POST"])
-def update_budget():
-    """
-    Updates the current budget value (sent from frontend).
-    """
+def set_and_get_budget():
+    global current_budget
+
     try:
-        data = request.get_json()
-        new_limit = float(data.get("budgetLimit", 5000))
+        data = request.get_json() or {}
+        print("📩 Received budget data:", data)
 
-        # ✅ Update in-memory budget
-        current_budget["budgetLimit"] = new_limit
+        # 1️⃣ Update budget if provided
+        if "amount" in data:
+            current_budget["amount"] = float(data["amount"])
+        if "month" in data:
+            current_budget["month"] = data["month"]
 
-        print(f"✅ Budget updated to: {new_limit}")
+        print(f"✅ Updated budget: {current_budget}")
 
+        # 2️⃣ Fetch transactions from DynamoDB
+        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+        transactions_table = dynamodb.Table("Transactions")
+
+        print("📥 Fetching all transactions from DynamoDB...")
+        response = transactions_table.scan()
+        items = response.get("Items", [])
+        print(f"✅ Retrieved {len(items)} transactions")
+
+        # 3️⃣ Calculate total spent (sum of all expense transactions)
+        total_spent = sum(
+            float(item.get("amount", 0))
+            for item in items
+            if item.get("type") == "expense"
+        )
+
+        print(f"💰 Total spent: {total_spent}, Budget: {current_budget['amount']}")
+
+        # 4️⃣ If overspending, send SES alert
+        if total_spent > current_budget["amount"]:
+            print("⚠️ Overspending detected — sending SES alert...")
+            send_budget_alert_email(total_spent, current_budget["amount"])
+
+        # 5️⃣ Return current budget + spent
         return jsonify({
-            "message": "✅ Budget updated successfully",
-            "budgetLimit": new_limit
+            "month": current_budget["month"],
+            "amount": current_budget["amount"],
+            "spent": total_spent
         }), 200
 
-    except Exception as e:
-        print(f"❌ [POST /budget] Error: {e}")
+    except ClientError as e:
+        print("❌ AWS ClientError:", e)
         return jsonify({"error": str(e)}), 500
-
+    except Exception as e:
+        print("❌ Unexpected Error:", e)
+        return jsonify({"error": str(e)}), 500
 
 # ---------- Upload endpoint (uses the inline helpers above) ----------
 

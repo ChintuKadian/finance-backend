@@ -242,6 +242,13 @@ def _to_float_safe(v):
         return 0.0
 
 #----------helper function
+def _to_float_safe(v):
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+
 def _sum_transactions_for_user_month(user_id: str, month_prefix: str) -> float:
     """
     Sum up 'amount' from Transactions table for a user and month.

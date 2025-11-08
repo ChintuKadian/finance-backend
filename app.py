@@ -282,43 +282,68 @@ def send_budget_alert_email(current_spent, budget):
 
 # ---------- Budget endpoints (inline) ----------
 
-current_budget = {"amount": 5000, "month": "2025-11"}
+# 🔹 Store current budget in memory (acts like a temporary DB)
+current_budget = {
+    "amount": 5000,  # default value
+    "month": datetime.now().strftime("%Y-%m")
+}
 
 
 
 @app.route("/budget", methods=["GET", "POST"])
-def set_and_get_budget():
-    global current_budget
+def handle_budget():
+    global current_budget  # use the global variable
 
     try:
-        if request.method == "POST":
-            data = request.get_json() or {}
-            print("📩 Received budget data:", data)
-            if "amount" in data:
-                current_budget["amount"] = float(data["amount"])
-            if "month" in data:
-                current_budget["month"] = data["month"]
-            print(f"✅ Updated budget: {current_budget}")
-
-        # Same code for scanning transactions
         dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
         transactions_table = dynamodb.Table("Transactions")
+
+        if request.method == "POST":
+            # 🟢 Log incoming data
+            data = request.get_json()
+            print("📩 Incoming POST data:", data)
+
+            if not data or "amount" not in data:
+                print("⚠️ No 'amount' found in request!")
+                return jsonify({"error": "Missing 'amount' field"}), 400
+
+            try:
+                amount = float(data.get("amount"))
+            except ValueError:
+                print("❌ Invalid amount received:", data.get("amount"))
+                return jsonify({"error": "Invalid budget amount"}), 400
+
+            current_budget["amount"] = amount
+            current_budget["month"] = datetime.now().strftime("%Y-%m")
+
+            print(f"✅ Budget updated successfully: {current_budget}")
+            return jsonify({
+                "message": "Budget updated successfully",
+                "budget": current_budget["amount"]
+            }), 200
+
+        # 🔹 Handle GET request
+        print("📥 Fetching transactions from DynamoDB for budget check...")
         response = transactions_table.scan()
         items = response.get("Items", [])
-        total_spent = sum(float(item.get("amount", 0)) for item in items if item.get("type") == "expense")
+        print(f"📦 Retrieved {len(items)} transactions")
 
-        if total_spent > current_budget["amount"]:
-            print("⚠️ Overspending detected — sending SES alert...")
-            send_budget_alert_email(total_spent, current_budget["amount"])
+        total_spent = sum(
+            float(item.get("amount", 0))
+            for item in items
+            if item.get("type") == "expense"
+        )
+
+        print(f"💰 Total spent = {total_spent}, Budget = {current_budget['amount']}")
 
         return jsonify({
             "month": current_budget["month"],
-            "amount": current_budget["amount"],
+            "budget": current_budget["amount"],
             "spent": total_spent
         }), 200
 
     except Exception as e:
-        print("❌ Error:", e)
+        print("❌ Error in /budget:", e)
         return jsonify({"error": str(e)}), 500
 
 # ---------- Upload endpoint (uses the inline helpers above) ----------

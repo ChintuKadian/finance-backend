@@ -352,7 +352,7 @@ def export_data_to_s3():
         print(json_data[:300] + "..." if len(json_data) > 300 else json_data)
 
         # 3️⃣ Upload to S3
-        bucket_name = "your-bucket-name-here"  # ⚠️ Replace with your actual S3 bucket name
+        bucket_name = "finance-tracker-store"  # ⚠️ Replace with your actual S3 bucket name
         file_name = "transactions_export.json"
         print(f"🚀 Uploading data to S3 bucket: {bucket_name} as {file_name} ...")
 

@@ -297,107 +297,64 @@ def _sum_transactions_for_user_month(user_id: str, month_prefix: str) -> float:
         print(f"❌ Error computing total spent: {e}")
         return 0.0
 # ---------- Budget endpoints (inline) ----------
+
 @app.route("/budget", methods=["GET"])
-def get_budget_route():
-    """
-    Fetch the user's budget and spending for the given month.
-    Dynamically calculates spent total from Transactions table.
-    """
-    user_id = request.args.get("userId")
-    month = request.args.get("month") or datetime.date.today().strftime("%Y-%m")
-
-    if not user_id:
-        return jsonify({"error": "userId is required"}), 400
-
+def get_budget():
     try:
-        # 🟢 Try to get item by key (preferred)
-        try:
-            resp = budgets_table.get_item(Key={"userId": user_id, "month": month})
-            budget_item = resp.get("Item")
-        except ClientError:
-            app.logger.warning("⚠️ get_item failed; falling back to scan()")
-            budget_item = None
+        print("🔍 [GET /budget] Fetching all transactions to calculate total spent...")
 
-        # 🔵 If get_item fails or no item found, scan with reserved word fix
-        if not budget_item:
-            scan_resp = budgets_table.scan(
-                FilterExpression=Attr("userId").eq(user_id) & Attr("month").eq(month),
-                ProjectionExpression="#u, #m, budgetLimit, updatedAt",
-                ExpressionAttributeNames={
-                    "#u": "userId",
-                    "#m": "month",
-                },
+        # --- 1️⃣ Scan all transactions ---
+        transactions_table = dynamodb.Table(TRANSACTIONS_TABLE)
+        response = transactions_table.scan(ProjectionExpression="amount")
+        items = response.get("Items", [])
+
+        total_spent = sum(float(item.get("amount", 0)) for item in items)
+
+        while "LastEvaluatedKey" in response:
+            response = transactions_table.scan(
+                ProjectionExpression="amount",
+                ExclusiveStartKey=response["LastEvaluatedKey"]
             )
-            items = scan_resp.get("Items", [])
-            budget_item = items[0] if items else None
+            total_spent += sum(float(item.get("amount", 0)) for item in response.get("Items", []))
 
-        # 🧮 Compute budget/spent/remaining
-        budget_limit = float(budget_item.get("budgetLimit", 0.0)) if budget_item else 0.0
-        spent = _sum_transactions_for_user_month(user_id, month)
-        remaining = budget_limit - spent
+        print(f"✅ Total spent (all months, all users): {total_spent}")
 
+        # --- 2️⃣ Get current budget limit (store temporarily or from last POST) ---
+        # You can store it globally (in memory) if you’re not using a table:
+        global current_budget
+        if "current_budget" not in globals():
+            current_budget = {"budgetLimit": 0.0}
+
+        budget_limit = float(current_budget.get("budgetLimit", 0.0))
+        remaining = budget_limit - total_spent
+
+        # --- 3️⃣ Return the combined result ---
         return jsonify({
-            "userId": user_id,
-            "month": month,
             "budgetLimit": budget_limit,
-            "spent": spent,
+            "spent": total_spent,
             "remaining": remaining,
-            "budgetItem": budget_item or {},
+            "month": "2025-11"  # fixed for now
         }), 200
 
-    except Exception as exc:
-        app.logger.exception("❌ Failed to fetch budget")
-        return jsonify({"error": str(exc)}), 500
-
+    except Exception as e:
+        print(f"❌ [GET /budget] Error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/budget", methods=["POST"])
-def post_budget_route():
-    """
-    Create or update the user's monthly budget.
-    """
+def set_budget():
     try:
-        data = request.get_json() or {}
-        user_id = data.get("userId")
-        budget_limit = data.get("budgetLimit") if "budgetLimit" in data else data.get("amount")
-        month = data.get("month") or datetime.date.today().strftime("%Y-%m")
-        category = data.get("category")
+        data = request.get_json()
+        budget_limit = float(data.get("budgetLimit", 2000))
+        global current_budget
+        current_budget = {"budgetLimit": budget_limit}
 
-        if not user_id:
-            return jsonify({"error": "userId is required"}), 400
-        if budget_limit is None:
-            return jsonify({"error": "budgetLimit is required"}), 400
+        print(f"✅ Budget updated to: {budget_limit}")
+        return jsonify({"message": "Budget updated successfully", "budgetLimit": budget_limit}), 200
+    except Exception as e:
+        print(f"❌ [POST /budget] Error: {e}")
+        return jsonify({"error": str(e)}), 500
 
-        # 🟢 Save to DynamoDB
-        item = {
-            "userId": user_id,
-            "month": month,
-            "budgetLimit": Decimal(str(float(budget_limit))),
-            "updatedAt": datetime.datetime.utcnow().isoformat() + "Z",
-        }
-        if category:
-            item["category"] = category
 
-        budgets_table.put_item(Item=item)
-
-        # 🧮 Compute current totals
-        spent = _sum_transactions_for_user_month(user_id, month)
-        remaining = float(item["budgetLimit"]) - spent
-
-        # 🟢 Return as clean JSON
-        return jsonify({
-            "budget": {
-                "userId": user_id,
-                "month": month,
-                "budgetLimit": float(item["budgetLimit"]),
-                "updatedAt": item["updatedAt"],
-            },
-            "spent": spent,
-            "remaining": remaining,
-        }), 201
-
-    except Exception as exc:
-        app.logger.exception("❌ Failed to create/update budget")
-        return jsonify({"error": str(exc)}), 500
 
 # ---------- Upload endpoint (uses the inline helpers above) ----------
 @app.route("/upload-and-add-transaction", methods=["POST"])

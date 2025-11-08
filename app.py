@@ -249,67 +249,51 @@ def _to_float_safe(v):
         return 0.0
 
 
-def _sum_transactions_for_user_month(user_id: str, month_prefix: str) -> float:
-    """
-    Sum up 'amount' from Transactions table for a user and month.
-    Supports both GSI query and fallback scan.
-    """
-    try:
-        table = dynamodb.Table(TRANSACTIONS_TABLE)
-        index_name = "userId-date-index"
-        total = 0.0
 
-        # 🟢 Try using GSI if available
-        try:
-            resp = table.query(
-                IndexName=index_name,
-                KeyConditionExpression=Key("userId").eq(user_id) & Key("date").begins_with(month_prefix),
-                ProjectionExpression="amount",
-            )
-            total += sum(_to_float_safe(i.get("amount", 0)) for i in resp.get("Items", []))
-            while "LastEvaluatedKey" in resp:
-                resp = table.query(
-                    IndexName=index_name,
-                    KeyConditionExpression=Key("userId").eq(user_id) & Key("date").begins_with(month_prefix),
-                    ProjectionExpression="amount",
-                    ExclusiveStartKey=resp["LastEvaluatedKey"],
-                )
-                total += sum(_to_float_safe(i.get("amount", 0)) for i in resp.get("Items", []))
-            return total
-
-        except ClientError:
-            pass  # fallback if index doesn't exist
-
-        # 🔵 Fallback to scan
-        scan_kwargs = {
-            "FilterExpression": Attr("userId").eq(user_id) & Attr("date").begins_with(month_prefix),
-            "ProjectionExpression": "amount",
-        }
-        resp = table.scan(**scan_kwargs)
-        total += sum(_to_float_safe(i.get("amount", 0)) for i in resp.get("Items", []))
-        while "LastEvaluatedKey" in resp:
-            scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
-            resp = table.scan(**scan_kwargs)
-            total += sum(_to_float_safe(i.get("amount", 0)) for i in resp.get("Items", []))
-        return total
-
-    except Exception as e:
-        print(f"❌ Error computing total spent: {e}")
-        return 0.0
 # ---------- Budget endpoints (inline) ----------
 
+current_budget = {"budgetLimit": 5000.0}
+
+# ----------------------------
+# 🟢 POST /budget → set budget
+# ----------------------------
+@app.route("/budget", methods=["POST"])
+def set_budget():
+    try:
+        data = request.get_json()
+        budget_limit = float(data.get("budgetLimit", 0))
+        global current_budget
+        current_budget["budgetLimit"] = budget_limit
+
+        print(f"✅ Budget updated to: {budget_limit}")
+        return jsonify({
+            "message": "Budget updated successfully",
+            "budgetLimit": budget_limit
+        }), 200
+    except Exception as e:
+        print(f"❌ [POST /budget] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ----------------------------
+# 🟢 GET /budget → get budget + spent
+# ----------------------------
 @app.route("/budget", methods=["GET"])
 def get_budget():
     try:
-        print("🔍 [GET /budget] Fetching all transactions to calculate total spent...")
+        print("🔍 Fetching all transactions to calculate total spent...")
 
-        # --- 1️⃣ Scan all transactions ---
+        # Scan all transactions
         transactions_table = dynamodb.Table(TRANSACTIONS_TABLE)
-        response = transactions_table.scan(ProjectionExpression="amount")
+        response = transactions_table.scan(
+            ProjectionExpression="amount , type",
+            FilterExpression=Attr("type").eq("expense")
+            )
         items = response.get("Items", [])
 
         total_spent = sum(float(item.get("amount", 0)) for item in items)
 
+        # Handle pagination
         while "LastEvaluatedKey" in response:
             response = transactions_table.scan(
                 ProjectionExpression="amount",
@@ -317,43 +301,22 @@ def get_budget():
             )
             total_spent += sum(float(item.get("amount", 0)) for item in response.get("Items", []))
 
-        print(f"✅ Total spent (all months, all users): {total_spent}")
+        print(f"✅ Total spent: {total_spent}")
 
-        # --- 2️⃣ Get current budget limit (store temporarily or from last POST) ---
-        # You can store it globally (in memory) if you’re not using a table:
-        global current_budget
-        if "current_budget" not in globals():
-            current_budget = {"budgetLimit": 0.0}
-
-        budget_limit = float(current_budget.get("budgetLimit", 0.0))
+        # Get stored budget (default = ₹5000)
+        budget_limit = float(current_budget.get("budgetLimit", 5000))
         remaining = budget_limit - total_spent
 
-        # --- 3️⃣ Return the combined result ---
         return jsonify({
+            "month": "2025-11",  # Fixed month
             "budgetLimit": budget_limit,
             "spent": total_spent,
-            "remaining": remaining,
-            "month": "2025-11"  # fixed for now
+            "remaining": remaining
         }), 200
 
     except Exception as e:
         print(f"❌ [GET /budget] Error: {e}")
         return jsonify({"error": str(e)}), 500
-
-@app.route("/budget", methods=["POST"])
-def set_budget():
-    try:
-        data = request.get_json()
-        budget_limit = float(data.get("budgetLimit", 2000))
-        global current_budget
-        current_budget = {"budgetLimit": budget_limit}
-
-        print(f"✅ Budget updated to: {budget_limit}")
-        return jsonify({"message": "Budget updated successfully", "budgetLimit": budget_limit}), 200
-    except Exception as e:
-        print(f"❌ [POST /budget] Error: {e}")
-        return jsonify({"error": str(e)}), 500
-
 
 
 # ---------- Upload endpoint (uses the inline helpers above) ----------
@@ -432,6 +395,30 @@ def upload_and_add_transaction():
     except Exception as exc:
         app.logger.exception("Failed to upload and add transaction")
         return jsonify({"error": str(exc)}), 500
+
+@app.route("/export-data", methods=["GET"])
+def export_data():
+    import csv, io, boto3
+    from datetime import datetime
+
+    s3 = boto3.client("s3")
+    transactions_table = dynamodb.Table("Transactions")
+    response = transactions_table.scan()
+    items = response.get("Items", [])
+
+    csv_buffer = io.StringIO()
+    writer = csv.DictWriter(csv_buffer, fieldnames=items[0].keys() if items else [])
+    writer.writeheader()
+    writer.writerows(items)
+
+    filename = f"transactions_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    s3.put_object(Bucket="finance-tracker-store", Key=filename, Body=csv_buffer.getvalue())
+    s3_url = f"https://finance-tracker-store.s3.amazonaws.com/{filename}"
+
+    return {"message": "Export successful", "s3_url": s3_url}
+
+
+
 
 
 @app.route("/health", methods=["GET"])

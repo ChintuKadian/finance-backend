@@ -282,7 +282,8 @@ def send_budget_alert_email(current_spent, budget):
 
 # ---------- Budget endpoints (inline) ----------
 
-current_budget = {"budgetLimit": 5000}
+current_budget = {"amount": 5000, "month": "2025-11"}
+
 
 
 @app.route("/budget", methods=["GET", "POST"])

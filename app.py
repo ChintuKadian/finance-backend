@@ -1,8 +1,11 @@
 # app.py - single-file backend for Finance Tracker (Flask + DynamoDB + S3 + Textract)
 import os
+import io
 import re
 import uuid
 import json
+import pytesseract
+from PIL import Image
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional, Tuple
@@ -410,104 +413,53 @@ def export_data_to_s3():
         return jsonify({"error": str(e)}), 500
 
 # ----------upload file
+
+
 @app.route("/upload-receipt", methods=["POST"])
 def upload_receipt():
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-
-    file = request.files["file"]
-    file_bytes = file.read()
-
     try:
-        # 🔹 Run Textract analysis
-        print("📄 Sending file to Textract...")
-        response = textract.analyze_document(
-            Document={'Bytes': file_bytes},
-            FeatureTypes=["TABLES", "FORMS"]
-        )
+        file = request.files.get("file")
+        if not file:
+            return jsonify({"error": "No file uploaded"}), 400
 
-        # 🔹 Extract all detected lines of text
-        lines = []
-        for block in response["Blocks"]:
-            if block["BlockType"] == "LINE":
-                lines.append(block["Text"])
+        print("📄 Received file:", file.filename)
 
-        full_text = " ".join(lines)
-        print("🧾 Extracted Text:", full_text)
+        # Read image from file stream
+        image = Image.open(io.BytesIO(file.read()))
 
-        # ---------- SMART PARSING LOGIC ----------
+        # Extract text using Tesseract OCR
+        extracted_text = pytesseract.image_to_string(image)
+        print("🧾 Extracted text:", extracted_text)
 
-        # 1️⃣ Extract date
-        import re
-        date_patterns = [
-            r"\b\d{2}[/-]\d{2}[/-]\d{4}\b",  # e.g. 12/11/2025
-            r"\b\d{4}[/-]\d{2}[/-]\d{2}\b"   # e.g. 2025-11-12
-        ]
-        date = None
-        for pattern in date_patterns:
-            match = re.search(pattern, full_text)
-            if match:
-                date = match.group()
-                break
-        if not date:
-            date = datetime.now().strftime("%Y-%m-%d")
+        # Try to extract numeric amount (first number found)
+        match = re.search(r'(\d+(?:\.\d{1,2})?)', extracted_text)
+        amount = float(match.group(1)) if match else 0.0
 
-        # 2️⃣ Extract total amount
-        amount_patterns = [
-            r"TOTAL\s*[:\-]?\s*₹?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            r"AMOUNT\s*[:\-]?\s*₹?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            r"RS\.?\s*([0-9]+(?:\.[0-9]{1,2})?)"
-        ]
+        print(f"💰 Parsed Amount: ₹{amount}")
 
-        amount = None
-        for pattern in amount_patterns:
-            match = re.search(pattern, full_text.upper())
-            if match:
-                amount = float(match.group(1))
-                break
-        if not amount:
-            # fallback: largest number in text
-            numbers = re.findall(r"\d+(?:\.\d{1,2})?", full_text)
-            amount = float(max(numbers, key=float)) if numbers else 0
-
-        # 3️⃣ Extract item name (optional heuristic)
-        item = None
-        for line in lines:
-            if any(word in line.lower() for word in ["item", "product", "description"]):
-                item = line.strip()
-                break
-        if not item:
-            item = "General Purchase"
-
-        # ---------- Save to DynamoDB ----------
+        # Example: Automatically create a transaction
         transaction = {
-            "userId": "testuser",
-            "transactionId": str(uuid.uuid4()),
-            "date": date,
-            "item": item,
+            "userId": "test-user",
+            "type": "expense",
             "amount": amount,
-            "type": "expense"
+            "description": "Auto-generated from receipt"
         }
 
-        print("✅ Transaction parsed:", transaction)
-        transactions_table.put_item(Item=transaction)
+        # Optionally, store in DynamoDB
+        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+        table = dynamodb.Table("Transactions")
+        table.put_item(Item=transaction)
 
-        # ---------- Check Budget + Send Alert ----------
-        response = transactions_table.scan()
-        items = response.get("Items", [])
-        total_spent = sum(float(i.get("amount", 0)) for i in items)
-
-        if total_spent > current_budget["amount"] and not current_budget["alert_sent"]:
-            send_budget_alert_email(total_spent, current_budget["amount"])
-            current_budget["alert_sent"] = True
+        print("✅ Transaction saved to DynamoDB")
 
         return jsonify({
             "message": "Receipt processed successfully",
-            "transaction": transaction
+            "extractedAmount": amount,
+            "rawText": extracted_text
         }), 200
 
     except Exception as e:
-        print("❌ Error processing receipt:", e)
+        print("❌ Error in /upload-receipt:", e)
         return jsonify({"error": str(e)}), 500
 
 

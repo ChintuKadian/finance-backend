@@ -1,253 +1,368 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from datetime import datetime
-import boto3
-import uuid
+# app.py - single-file backend for Finance Tracker (Flask + DynamoDB + S3 + Textract)
 import os
 import re
-from datetime import datetime
+import uuid
+import datetime
 from decimal import Decimal
-import config 
-from typing import Optional
+from typing import Optional, Tuple
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
-from utils.s3_utils import upload_fileobj_to_s3, make_s3_object_url
-from utils.textract_utils import extract_text_from_s3, parse_amount_and_date_from_text
-from utils.db_utils import insert_transaction
+
+import boto3
+from botocore.exceptions import ClientError
+from boto3.dynamodb.conditions import Key, Attr
+
+import config
 
 app = Flask(__name__)
 CORS(app)
 
-#===for upload files setup
-s3 = boto3.client("s3", region_name="us-east-1")
-textract = boto3.client("textract", region_name="us-east-1")
-BUCKET_NAME = "finance-tracker-store"
-S3_BUCKET = os.environ.get("S3_BUCKET")
+# ---------- Config / Table names ----------
+AWS_REGION = getattr(config, "AWS_REGION", os.environ.get("AWS_REGION", "us-east-1"))
+TRANSACTIONS_TABLE = getattr(config, "TRANSACTIONS_TABLE", "Transactions")
+BUDGETS_TABLE = getattr(config, "BUDGETS_TABLE", "UserBudgetsNew")
+S3_BUCKET = getattr(config, "S3_BUCKET", os.environ.get("S3_BUCKET", None))
+BUCKET_NAME = S3_BUCKET or "finance-tracker-store"
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "pdf"}
 
-# ---------- DynamoDB Setup ----------
-dynamodb = boto3.resource('dynamodb', region_name='us-east-1')  # change region if needed
-transactions_table = dynamodb.Table('Transactions')
-budget_table = dynamodb.Table('UserBudgets')
+# ---------- AWS clients ----------
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+s3 = boto3.client("s3", region_name=AWS_REGION)
+textract = boto3.client("textract", region_name=AWS_REGION)
 
-# ---------- Helper function ----------
+# Ensure table objects (these will raise at runtime if table names are wrong)
+transactions_table = dynamodb.Table(TRANSACTIONS_TABLE)
+budgets_table = dynamodb.Table(BUDGETS_TABLE)
+
+
+# ---------- Utilities ----------
 def decimal_to_float(obj):
-    """Convert DynamoDB Decimals to normal float/int for JSON serialization"""
+    """Recursively convert DynamoDB Decimals to float for JSON serialization."""
     if isinstance(obj, list):
         return [decimal_to_float(i) for i in obj]
-    elif isinstance(obj, dict):
+    if isinstance(obj, dict):
         return {k: decimal_to_float(v) for k, v in obj.items()}
-    elif isinstance(obj, Decimal):
+    if isinstance(obj, Decimal):
         return float(obj)
     return obj
 
-# ---------- Routes ----------
 
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+# ---- S3 helpers ----
+def upload_fileobj_to_s3(file_obj, bucket: str, key: str, content_type: str = None):
+    """
+    Upload a file-like object to S3. `file_obj` may be werkzeug FileStorage or a file-like stream.
+    """
+    # Read bytes from file-like object. Use .stream if present.
+    try:
+        if hasattr(file_obj, "stream"):
+            body = file_obj.stream.read()
+        else:
+            body = file_obj.read()
+        extra_args = {}
+        if content_type:
+            extra_args["ContentType"] = content_type
+        s3.put_object(Bucket=bucket, Key=key, Body=body, **(extra_args or {}))
+        return True
+    except ClientError as e:
+        app.logger.exception("S3 upload failed: %s", e)
+        raise
+
+
+def make_s3_object_url(bucket: str, key: str) -> str:
+    """Return a simple S3 URL. For private buckets you may want to use presigned URLs."""
+    return f"https://{bucket}.s3.amazonaws.com/{key}"
+
+
+# ---- Textract / parsing helpers (simple) ----
+def extract_text_from_s3(bucket: str, key: str) -> str:
+    """
+    Calls Textract detect_document_text on an S3 object and returns concatenated text.
+    Returns empty string on error.
+    """
+    try:
+        resp = textract.detect_document_text(Document={"S3Object": {"Bucket": bucket, "Name": key}})
+        lines = []
+        for block in resp.get("Blocks", []):
+            if block.get("BlockType") == "LINE":
+                lines.append(block.get("Text", ""))
+        return "\n".join(lines)
+    except ClientError as e:
+        app.logger.warning("Textract error: %s", e)
+        return ""
+    except Exception as e:
+        app.logger.warning("Textract unknown error: %s", e)
+        return ""
+
+
+def parse_amount_and_date_from_text(text: str) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Simple heuristics to find the largest money-like number and common date patterns.
+    Returns (amount, date_iso) where amount is float or None, date_iso is YYYY-MM-DD or None.
+    """
+    if not text:
+        return None, None
+
+    # Match numbers like 1,234.56 or 1234.56 or 1234
+    amounts = re.findall(r"\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b|\b\d+(?:\.\d{1,2})?\b", text)
+    parsed_amounts = []
+    for a in amounts:
+        try:
+            parsed_amounts.append(float(a.replace(",", "")))
+        except Exception:
+            continue
+    amount = max(parsed_amounts) if parsed_amounts else None
+
+    # Date patterns
+    date_patterns = [
+        r"(\d{4}-\d{2}-\d{2})",  # 2025-11-08
+        r"(\d{2}/\d{2}/\d{4})",  # 08/11/2025 or 11/08/2025
+        r"(\d{2}-\d{2}-\d{4})",  # 08-11-2025
+        r"(\d{2}\.\d{2}\.\d{4})"  # 08.11.2025
+    ]
+    parsed_date = None
+    for pat in date_patterns:
+        m = re.search(pat, text)
+        if not m:
+            continue
+        s = m.group(1)
+        try:
+            if "-" in s and len(s.split("-")[0]) == 4:
+                parsed_date = s  # already YYYY-MM-DD
+            elif "/" in s:
+                # Try both common orders. We'll attempt day/month/year, then month/day/year.
+                try:
+                    dt = datetime.datetime.strptime(s, "%d/%m/%Y")
+                    parsed_date = dt.date().isoformat()
+                except Exception:
+                    try:
+                        dt = datetime.datetime.strptime(s, "%m/%d/%Y")
+                        parsed_date = dt.date().isoformat()
+                    except Exception:
+                        parsed_date = None
+            elif "-" in s:
+                dt = datetime.datetime.strptime(s, "%d-%m-%Y")
+                parsed_date = dt.date().isoformat()
+            elif "." in s:
+                dt = datetime.datetime.strptime(s, "%d.%m.%Y")
+                parsed_date = dt.date().isoformat()
+            if parsed_date:
+                break
+        except Exception:
+            continue
+
+    return amount, parsed_date
+
+
+# ---- DynamoDB insert helper ----
+def insert_transaction(table_name: str, tx_item: dict):
+    """
+    Insert a transaction into DynamoDB. Converts floats to Decimal.
+    tx_item must contain at least: id, userId, amount, category, date, note, type, createdAt.
+    """
+    table = dynamodb.Table(table_name)
+    item = dict(tx_item)
+    item.setdefault("id", str(uuid.uuid4()))
+    item.setdefault("createdAt", datetime.datetime.utcnow().isoformat() + "Z")
+    # convert numeric fields to Decimal
+    if "amount" in item:
+        item["amount"] = Decimal(str(item["amount"]))
+    try:
+        table.put_item(Item=item)
+    except ClientError as e:
+        app.logger.exception("DynamoDB put_item failed: %s", e)
+        raise
+
+
+# ---------- Routes ----------
 @app.route("/")
 def home():
     return jsonify({"message": "Finance backend connected to DynamoDB!"})
 
 
-# ---- Get all transactions ----
+# ---- Transactions: GET /transactions
 @app.route("/transactions", methods=["GET"])
 def get_transactions():
-    response = transactions_table.scan()
-    items = response.get('Items', [])
-    return jsonify(decimal_to_float(items))
+    try:
+        resp = transactions_table.scan()
+        items = resp.get("Items", [])
+        return jsonify(decimal_to_float(items))
+    except Exception as e:
+        app.logger.exception("Failed to scan transactions")
+        return jsonify({"error": str(e)}), 500
 
 
-# ---- Add a transaction ----
+# ---- Transactions: POST /transactions
 @app.route("/transactions", methods=["POST"])
 def add_transaction():
-    data = request.get_json()
-    new_tx = {
-        "userId": "default_user",  # ✅ Add this line (required by DynamoDB)
-        "transactionId": str(uuid.uuid4()),
-        "amount": data.get("amount"),
-        "category": data.get("category"),
-        "date": data.get("date", datetime.now().strftime("%Y-%m-%d")),
-        "note": data.get("note", ""),
-        "type": data.get("type", "expense")
-    }
-
-    print("Adding transaction:", new_tx)  # Optional for debugging
-    transactions_table.put_item(Item=new_tx)
-    return jsonify(new_tx), 201
+    try:
+        data = request.get_json() or {}
+        tx_id = str(uuid.uuid4())
+        item = {
+            "id": tx_id,
+            "transactionId": tx_id,
+            "userId": data.get("userId", "default_user"),
+            "amount": Decimal(str(data.get("amount", 0))),
+            "category": data.get("category", "uncategorized"),
+            "date": data.get("date", datetime.date.today().isoformat()),
+            "note": data.get("note", ""),
+            "type": data.get("type", "expense"),
+            "createdAt": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+        transactions_table.put_item(Item=item)
+        return jsonify(decimal_to_float(item)), 201
+    except Exception as e:
+        app.logger.exception("Failed to add transaction")
+        return jsonify({"error": str(e)}), 500
 
 
 # ---- Summary ----
 @app.route("/summary", methods=["GET"])
 def get_summary():
-    response = transactions_table.scan()
-    items = response.get('Items', [])
-
-    total_income = sum(float(t["amount"]) for t in items if t["type"] == "income")
-    total_expense = sum(float(t["amount"]) for t in items if t["type"] == "expense")
-    balance = total_income - total_expense
-
-    return jsonify({
-        "totalIncome": total_income,
-        "totalExpenses": total_expense,
-        "balance": balance
-    })
+    try:
+        resp = transactions_table.scan()
+        items = resp.get("Items", [])
+        total_income = sum(float(t["amount"]) for t in items if t.get("type") == "income")
+        total_expense = sum(float(t["amount"]) for t in items if t.get("type") == "expense")
+        balance = total_income - total_expense
+        return jsonify({"totalIncome": total_income, "totalExpenses": total_expense, "balance": balance})
+    except Exception as e:
+        app.logger.exception("Failed to compute summary")
+        return jsonify({"error": str(e)}), 500
 
 
-# ---- Budget Routes (Using UserBudgetsNew table) ----
+# ---------- Budget endpoints (inline) ----------
+def _to_float_safe(v):
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _sum_transactions_for_user_month(user_id: str, month_prefix: str) -> float:
+    """
+    Sum amounts for transactions of user_id where date starts with month_prefix (YYYY-MM).
+    Tries to use a GSI 'userId-date-index' first; otherwise scans.
+    """
+    table = dynamodb.Table(TRANSACTIONS_TABLE)
+    index_name = "userId-date-index"
+    try:
+        resp = table.query(
+            IndexName=index_name,
+            KeyConditionExpression=Key("userId").eq(user_id) & Key("date").begins_with(month_prefix),
+            ProjectionExpression="amount",
+        )
+        total = sum(_to_float_safe(item.get("amount", 0)) for item in resp.get("Items", []))
+        while "LastEvaluatedKey" in resp:
+            resp = table.query(
+                IndexName=index_name,
+                KeyConditionExpression=Key("userId").eq(user_id) & Key("date").begins_with(month_prefix),
+                ProjectionExpression="amount",
+                ExclusiveStartKey=resp["LastEvaluatedKey"],
+            )
+            total += sum(_to_float_safe(item.get("amount", 0)) for item in resp.get("Items", []))
+        return total
+    except ClientError:
+        pass
+    except Exception:
+        pass
+
+    # fallback scan
+    total = 0.0
+    scan_kwargs = {
+        "FilterExpression": Attr("userId").eq(user_id) & Attr("date").begins_with(month_prefix),
+        "ProjectionExpression": "amount",
+        "Limit": 1000,
+    }
+    resp = table.scan(**scan_kwargs)
+    total += sum(_to_float_safe(item.get("amount", 0)) for item in resp.get("Items", []))
+    while "LastEvaluatedKey" in resp:
+        scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        resp = table.scan(**scan_kwargs)
+        total += sum(_to_float_safe(item.get("amount", 0)) for item in resp.get("Items", []))
+    return total
+
 
 @app.route("/budget", methods=["GET"])
-def get_budget():
+def get_budget_route():
+    user_id = request.args.get("userId")
+    month = request.args.get("month") or datetime.date.today().strftime("%Y-%m")
+    if not user_id:
+        return jsonify({"error": "userId is required"}), 400
     try:
-        print("🔍 [GET /budget] Fetching budget from table: UserBudgetsNew")
-        response = budget_table.scan()
-        items = response.get('Items', [])
-        print(f"✅ [GET /budget] Items fetched: {items}")
+        budget_item = None
+        try:
+            resp = budgets_table.get_item(Key={"userId": user_id, "month": month})
+            budget_item = resp.get("Item")
+        except ClientError:
+            scan_resp = budgets_table.scan(
+                FilterExpression=Attr("userId").eq(user_id) & Attr("month").eq(month),
+                ProjectionExpression="userId, month, budgetLimit, updatedAt",
+            )
+            items = scan_resp.get("Items", [])
+            budget_item = items[0] if items else None
 
-        if not items:
-            return jsonify({"message": "No budget found"}), 404
-
-        # 🔄 Convert DynamoDB Decimals and rename fields for frontend compatibility
-        formatted_items = []
-        for item in items:
-            formatted_items.append({
-                "month": item.get("month", ""),
-                "amount": float(item.get("budgetLimit", 0)),
-                "spent": float(item.get("spent", 0)),
-                "category": item.get("category", ""),
-                "userId": item.get("userId", "")
-            })
-
-        return jsonify(formatted_items)
-
-    except Exception as e:
-        print(f"❌ [GET /budget] Error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ---- add budgets 
-@app.route("/budget", methods=["POST"])
-def add_budget():
-    try:
-        data = request.get_json()
-        print("📝 [POST /budget] Received data:", data)
-
-        user_id = data.get("userId")
-        month = data.get("month")
-        budget_limit = data.get("budgetLimit")
-        category = data.get("category")
-        spent = data.get("spent", 0)
-
-        if not all([user_id, month, budget_limit, category]):
-            return jsonify({"error": "Missing required fields"}), 400
-
-        budget_item = {
+        budget_limit = _to_float_safe(budget_item.get("budgetLimit")) if budget_item and budget_item.get("budgetLimit") is not None else 0.0
+        spent = _sum_transactions_for_user_month(user_id, month)
+        remaining = budget_limit - spent
+        return jsonify({
             "userId": user_id,
             "month": month,
-            "category": category,
-            "budgetLimit": Decimal(str(budget_limit)),
-            "spent": Decimal(str(spent))
+            "budgetLimit": budget_limit,
+            "spent": spent,
+            "remaining": remaining,
+            "budgetItem": decimal_to_float(budget_item) if budget_item else None,
+        }), 200
+    except Exception as exc:
+        app.logger.exception("Failed to fetch budget")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/budget", methods=["POST"])
+def post_budget_route():
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("userId")
+        budget_limit = data.get("budgetLimit") if "budgetLimit" in data else data.get("amount")
+        month = data.get("month") or datetime.date.today().strftime("%Y-%m")
+        category = data.get("category")
+        if not user_id:
+            return jsonify({"error": "userId is required"}), 400
+        if budget_limit is None:
+            return jsonify({"error": "budgetLimit is required"}), 400
+
+        item = {
+            "userId": user_id,
+            "month": month,
+            "budgetLimit": Decimal(str(float(budget_limit))),
+            "updatedAt": datetime.datetime.utcnow().isoformat() + "Z",
         }
+        if category:
+            item["category"] = category
+        budgets_table.put_item(Item=item)
 
-        # Save to DynamoDB
-        budget_table.put_item(Item=budget_item)
-        print("✅ [POST /budget] Saved successfully:", budget_item)
-        return jsonify({"message": "Budget added successfully", "item": budget_item}), 200
-
-    except Exception as e:
-        print(f"❌ [POST /budget] Error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-#------------upload files
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+        spent = _sum_transactions_for_user_month(user_id, month)
+        remaining = float(item["budgetLimit"]) - spent
+        item["budgetLimit"] = float(item["budgetLimit"])  # convert for json
+        return jsonify({"budget": decimal_to_float(item), "spent": spent, "remaining": remaining}), 201
+    except Exception as exc:
+        app.logger.exception("Failed to upsert budget")
+        return jsonify({"error": str(exc)}), 500
 
 
-def _normalize_amount(form_amount: Optional[str], parsed_amount: Optional[float]) -> (Optional[float], bool):
-    """
-    Returns (amount_value_or_None, was_inferred_bool)
-    - If form_amount is provided and valid, prefer it (inferred=False)
-    - Else if parsed_amount is provided, use it (inferred=True)
-    - Else return (None, False)
-    """
-    if form_amount:
-        try:
-            # Allow commas in input like "1,234.56"
-            cleaned = form_amount.replace(",", "").strip()
-            val = float(cleaned)
-            return val, False
-        except Exception:
-            # invalid user-provided amount — fall back to parsed_amount
-            pass
-
-    if parsed_amount is not None:
-        try:
-            return float(parsed_amount), True
-        except Exception:
-            return None, False
-
-    return None, False
-
-
-def _normalize_date(form_date: Optional[str], parsed_date) -> (Optional[str], bool):
-    """
-    Returns (date_iso_or_None, was_inferred_bool)
-    - If form_date is provided and valid ISO-like, prefer it (inferred=False)
-    - Else if parsed_date is a date object, convert to ISO and return (inferred=True)
-    - Else None
-    """
-    if form_date:
-        fd = form_date.strip()
-        # Try common formats: ISO first, then some slashed formats
-        try:
-            # try direct ISO (YYYY-MM-DD)
-            dt = datetime.date.fromisoformat(fd)
-            return dt.isoformat(), False
-        except Exception:
-            # try dd/mm/yyyy or dd-mm-yyyy
-            for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%m/%d/%Y"):
-                try:
-                    dt = datetime.datetime.strptime(fd, fmt).date()
-                    return dt.isoformat(), False
-                except Exception:
-                    continue
-            # If not parseable, ignore and fallback to parsed_date
-    if parsed_date:
-        # parsed_date may be a datetime.date already (from textract_utils)
-        if isinstance(parsed_date, (datetime.date, datetime.datetime)):
-            return parsed_date.isoformat(), True
-        else:
-            # if parsed_date is string, try to normalize
-            try:
-                # try parse as ISO first
-                dt = datetime.date.fromisoformat(str(parsed_date))
-                return dt.isoformat(), True
-            except Exception:
-                pass
-    return None, False
-
-
+# ---------- Upload endpoint (uses the inline helpers above) ----------
 @app.route("/upload-and-add-transaction", methods=["POST"])
 def upload_and_add_transaction():
-    """
-    Accepts form-data:
-      - file: (required) receipt image or pdf
-      - userId: (required) user identifier
-      - category: (optional) category string
-      - note: (optional) note string
-      - amount: (optional) numeric override (string allowed)
-      - date: (optional) date override (string allowed)
-    Behavior:
-      - Upload file to S3
-      - Call Textract (detect_document_text) to extract text
-      - Parse amount & date from Textract output (fallback heuristics)
-      - If frontend provided amount/date and they are valid, prefer them
-      - Insert transaction into DynamoDB and return the created item JSON
-    """
-    # Basic validations
     if "file" not in request.files:
         return jsonify({"error": "file is required"}), 400
-
     file = request.files["file"]
     if not file or file.filename == "":
         return jsonify({"error": "no file selected"}), 400
-
     if not allowed_file(file.filename):
         return jsonify({"error": f"file type not allowed. Allowed: {ALLOWED_EXTENSIONS}"}), 400
 
@@ -258,74 +373,61 @@ def upload_and_add_transaction():
     filename = secure_filename(file.filename)
     key = f"receipts/{user_id}/{uuid.uuid4().hex}_{filename}"
 
-    # read optional overrides from client
-    form_amount = request.form.get("amount")  # may be None
-    form_date = request.form.get("date")      # may be None
+    form_amount = request.form.get("amount")
+    form_date = request.form.get("date")
     category = request.form.get("category", "uncategorized")
     note = request.form.get("note", "")
 
     try:
         # Upload to S3
         file.seek(0)
-        upload_fileobj_to_s3(file.stream, S3_BUCKET, key, content_type=file.content_type)
+        upload_fileobj_to_s3(file, BUCKET_NAME, key, content_type=file.content_type)
 
-        # Extract text from S3 via Textract
-        extracted_text = extract_text_from_s3(S3_BUCKET, key)
-
-        # Parse amount+date from extracted text (heuristic)
+        # Textract
+        extracted_text = extract_text_from_s3(BUCKET_NAME, key)
         parsed_amount, parsed_date = parse_amount_and_date_from_text(extracted_text)
 
-        # Prefer client overrides if valid; otherwise use parsed values
-        amount_value, amount_inferred = _normalize_amount(form_amount, parsed_amount)
-        date_value, date_inferred = _normalize_date(form_date, parsed_date)
-
-        # Final fallback defaults
-        if amount_value is None:
-            # If no amount from either source, set to 0.0 but mark as not detected/inferred = False
+        # choose final amount/date
+        amount_value = None
+        date_value = None
+        try:
+            if form_amount:
+                amount_value = float(form_amount.replace(",", ""))
+            elif parsed_amount is not None:
+                amount_value = float(parsed_amount)
+            else:
+                amount_value = 0.0
+        except:
             amount_value = 0.0
-            amount_inferred = False
 
-        if date_value is None:
-            # default to today's date
-            date_value = datetime.date.today().isoformat()
-            date_inferred = False
+        # parse date
+        if form_date:
+            date_value = form_date
+        elif parsed_date:
+            date_value = parsed_date
         else:
-            date_inferred = date_inferred
+            date_value = datetime.date.today().isoformat()
 
-        # Build transaction item
+        # build transaction item
         transaction_id = str(uuid.uuid4())
-        receipt_url = make_s3_object_url(S3_BUCKET, key)
-
-        # naive type assignment: if amount > 0 treat as expense, else income (adjust as needed)
-        tx_type = "expense" if float(amount_value) >= 0 else "income"
-
-        transaction_item = {
+        receipt_url = make_s3_object_url(BUCKET_NAME, key)
+        tx_item = {
             "id": transaction_id,
+            "transactionId": transaction_id,
             "userId": user_id,
-            "amount": float(amount_value),
+            "amount": amount_value,
             "category": category,
             "date": date_value,
             "note": note,
-            "type": tx_type,
+            "type": "expense" if float(amount_value) >= 0 else "income",
             "receiptUrl": receipt_url,
             "createdAt": datetime.datetime.utcnow().isoformat() + "Z",
-            "inferredFields": {
-                "amountDetected": bool(parsed_amount is not None),
-                "dateDetected": bool(parsed_date is not None),
-                "amountOverriddenByUser": bool(form_amount is not None),
-                "dateOverriddenByUser": bool(form_date is not None),
-                "finalAmountInferred": bool(amount_inferred),
-                "finalDateInferred": bool(date_inferred),
-            },
-            # optionally save the raw extracted_text for debugging (comment out in prod)
-            # "rawExtractedText": extracted_text
         }
 
-        # Insert into DynamoDB
-        insert_transaction(TRANSACTIONS_TABLE, transaction_item)
+        # insert into transactions table
+        insert_transaction(TRANSACTIONS_TABLE, tx_item)
 
-        return jsonify({"transaction": transaction_item}), 201
-
+        return jsonify({"transaction": decimal_to_float(tx_item)}), 201
     except Exception as exc:
         app.logger.exception("Failed to upload and add transaction")
         return jsonify({"error": str(exc)}), 500
@@ -340,17 +442,3 @@ if __name__ == "__main__":
     host = getattr(config, "HOST", "0.0.0.0")
     port = int(getattr(config, "PORT", 5000))
     app.run(host=host, port=port, debug=True)
-
-@app.route('/files', methods=['GET'])
-def list_files():
-    try:
-        response = s3.list_objects_v2(Bucket=BUCKET_NAME)
-        files = [obj['Key'] for obj in response.get('Contents', [])]
-        return jsonify(files)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
-
-# ---------- Run Server ----------
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)

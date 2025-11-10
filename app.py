@@ -4,14 +4,14 @@ import io
 import re
 import uuid
 import json
+from PIL import Image, ImageOps, ImageFilter
 import pytesseract
-from PIL import Image
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional, Tuple
 
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify,current_app
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
@@ -438,93 +438,24 @@ def ensure_table(table_name: str):
 
 @app.route("/upload-receipt", methods=["POST"])
 def upload_receipt():
-    """
-    Accepts form-data:
-      - file: image file (required)
-      - category: optional string
-      - userId (optional) in form-data or X-User-Id header
-    Returns:
-      { ok: true, transaction: { transactionId, userId, vendor, total, tax, date, category, rawText, createdAt } }
-    """
-    try:
-        if "file" not in request.files:
-            return jsonify({"ok": False, "error": "No file field 'file' provided"}), 400
+    # Accept either "file" or "receipt" from the frontend
+    file_field = request.files.get("file") or request.files.get("receipt")
+    if not file_field:
+        # log keys to help debug
+        current_app.logger.info(f"request.files keys: {list(request.files.keys())}")
+        current_app.logger.info(f"request.form keys: {list(request.form.keys())}")
+        return jsonify({"ok": False, "error": "No file uploaded"}), 400
 
-        f = request.files["file"]
-        category = (request.form.get("category") or "").strip()
-        user_id = request.form.get("userId") or request.headers.get("X-User-Id") or "anonymous"
+    # save and do OCR (simplified)
+    filename = file_field.filename or f"{uuid.uuid4().hex}.jpg"
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    file_field.save(filepath)
+    img = Image.open(filepath).convert("L")
+    text = pytesseract.image_to_string(img, lang="eng")
 
-        # Save upload
-        filename = f.filename or f"{uuid.uuid4().hex}.jpg"
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
-        f.save(filepath)
+    # (optional) save to DynamoDB here...
 
-        # Preprocess image to improve OCR accuracy
-        img = Image.open(filepath)
-        img = img.convert("L")  # grayscale
-        img = ImageOps.autocontrast(img)
-        img = img.filter(ImageFilter.MedianFilter())
-
-        # OCR
-        raw_text = pytesseract.image_to_string(img, lang="eng")
-
-        # Extract fields
-        total = parse_amount_from_text(raw_text, ["total", "amount", "grand total", "net", "balance"])
-        tax = parse_amount_from_text(raw_text, ["tax", "vat"])
-        date_iso = parse_date_from_text(raw_text)
-
-        # Vendor detection: first non-empty line (conservative)
-        lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
-        vendor = lines[0] if lines else ""
-
-        # Build transaction item
-        transaction_id = str(uuid.uuid4())
-        created_at = datetime.utcnow().isoformat()
-
-        item = {
-            "transactionId": transaction_id,
-            "userId": str(user_id),
-            "vendor": vendor,
-            "rawText": raw_text,
-            "createdAt": created_at,
-        }
-        if category:
-            item["category"] = category
-        if total is not None:
-            item["total"] = Decimal(str(total))   # store as Decimal for DynamoDB numeric type
-        if tax is not None:
-            item["tax"] = Decimal(str(tax))
-        if date_iso:
-            item["transactionDate"] = date_iso
-
-        # Save to DynamoDB
-        table = ensure_table(transactions_table)
-        table.put_item(Item=item)
-
-        # Convert Decimals to strings for JSON response
-        out_item = item.copy()
-        if "total" in out_item:
-            out_item["total"] = str(out_item["total"])
-        if "tax" in out_item:
-            out_item["tax"] = str(out_item["tax"])
-
-        transaction_response = {
-            "transactionId": out_item["transactionId"],
-            "userId": out_item["userId"],
-            "vendor": out_item.get("vendor", ""),
-            "total": out_item.get("total"),
-            "tax": out_item.get("tax"),
-            "date": out_item.get("transactionDate"),
-            "category": out_item.get("category", ""),
-            "rawText": out_item.get("rawText", ""),
-            "createdAt": out_item.get("createdAt"),
-        }
-
-        return jsonify({"ok": True, "transaction": transaction_response})
-
-    except Exception as e:
-        app.logger.exception("upload error")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "text": text, "transaction": None})
 
 @app.route("/health", methods=["GET"])
 def health():

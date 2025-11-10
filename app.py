@@ -414,52 +414,78 @@ def export_data_to_s3():
 
 # ----------upload file
 
-
 @app.route("/upload-receipt", methods=["POST"])
 def upload_receipt():
-    try:
-        file = request.files.get("file")
-        if not file:
-            return jsonify({"error": "No file uploaded"}), 400
+    """
+    Simplified upload endpoint:
+      - No S3, directly passes image bytes to Textract
+      - Uses default userId
+      - Prints debug logs for visibility in EC2 terminal
+    """
 
+    if "file" not in request.files:
+        print("❌ No file received in request")
+        return jsonify({"error": "file is required"}), 400
+
+    file = request.files["file"]
+    if not file or file.filename == "":
+        print("❌ File missing or empty filename")
+        return jsonify({"error": "no file selected"}), 400
+
+    # Default user ID (no need to send from frontend)
+    user_id = "default_user"
+
+    try:
         print("📄 Received file:", file.filename)
 
-        # Read image from file stream
-        image = Image.open(io.BytesIO(file.read()))
+        # Read file bytes directly
+        file_bytes = file.read()
+        print(f"📦 File size: {len(file_bytes)} bytes")
 
-        # Extract text using Tesseract OCR
-        extracted_text = pytesseract.image_to_string(image)
-        print("🧾 Extracted text:", extracted_text)
+        # Call Textract directly (no S3 upload)
+        textract = boto3.client("textract", region_name="us-east-1")
+        response = textract.detect_document_text(Document={"Bytes": file_bytes})
+        print("✅ Textract API called successfully")
 
-        # Try to extract numeric amount (first number found)
-        match = re.search(r'(\d+(?:\.\d{1,2})?)', extracted_text)
-        amount = float(match.group(1)) if match else 0.0
+        # Extract all text lines
+        lines = [block["Text"] for block in response.get("Blocks", []) if block["BlockType"] == "LINE"]
+        extracted_text = "\n".join(lines)
+        print(f"🧾 Extracted {len(lines)} lines from image")
 
-        print(f"💰 Parsed Amount: ₹{amount}")
+        # --- Heuristic parsing for amount & date ---
+        amount_match = re.findall(r"\d+(?:\.\d{1,2})?", extracted_text)
+        amount = float(amount_match[-1]) if amount_match else 0.0
 
-        # Example: Automatically create a transaction
+        date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", extracted_text)
+        date = date_match.group(1) if date_match else datetime.date.today().isoformat()
+
+        # Build transaction item
+        tx_id = str(uuid.uuid4())
         transaction = {
-            "userId": "test-user",
+            "id": tx_id,
+            "transactionId": tx_id,
+            "userId": user_id,
+            "amount": Decimal(str(amount)),
+            "category": "uncategorized",
+            "date": date,
+            "note": "Auto-added via receipt",
             "type": "expense",
-            "amount": amount,
-            "description": "Auto-generated from receipt"
+            "createdAt": datetime.datetime.utcnow().isoformat() + "Z",
         }
 
-        # Optionally, store in DynamoDB
-        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
-        table = dynamodb.Table("Transactions")
-        table.put_item(Item=transaction)
+        # Save to DynamoDB
+        transactions_table.put_item(Item=transaction)
+        print(f"✅ Transaction saved in DynamoDB (ID: {tx_id})")
 
-        print("✅ Transaction saved to DynamoDB")
-
+        # Return result to frontend
         return jsonify({
             "message": "Receipt processed successfully",
-            "extractedAmount": amount,
-            "rawText": extracted_text
-        }), 200
+            "transaction": decimal_to_float(transaction),
+            "extractedText": extracted_text[:500]  # limit preview for readability
+        }), 201
 
     except Exception as e:
-        print("❌ Error in /upload-receipt:", e)
+        print("❌ Error in /upload-receipt:", str(e))
         return jsonify({"error": str(e)}), 500
 
 

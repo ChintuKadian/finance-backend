@@ -22,6 +22,8 @@ from boto3.dynamodb.conditions import Key, Attr
 import config
 
 app = Flask(__name__)
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 CORS(app)
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
 s3 = boto3.client('s3', region_name='us-east-1')
@@ -414,80 +416,22 @@ def export_data_to_s3():
 
 # ----------upload file
 
-@app.route("/upload-receipt", methods=["POST"])
+@app.route('/upload-receipt', methods=['POST'])
 def upload_receipt():
-    """
-    Simplified upload endpoint:
-      - No S3, directly passes image bytes to Textract
-      - Uses default userId
-      - Prints debug logs for visibility in EC2 terminal
-    """
-
-    if "file" not in request.files:
-        print("❌ No file received in request")
-        return jsonify({"error": "file is required"}), 400
-
-    file = request.files["file"]
-    if not file or file.filename == "":
-        print("❌ File missing or empty filename")
-        return jsonify({"error": "no file selected"}), 400
-
-    # Default user ID (no need to send from frontend)
-    user_id = "default_user"
-
     try:
-        print("📄 Received file:", file.filename)
+        if 'receipt' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        file = request.files['receipt']
+        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+        file.save(filepath)
 
-        # Read file bytes directly
-        file_bytes = file.read()
-        print(f"📦 File size: {len(file_bytes)} bytes")
+        # Run Tesseract OCR
+        text = pytesseract.image_to_string(Image.open(filepath))
 
-        # Call Textract directly (no S3 upload)
-        textract = boto3.client("textract", region_name="us-east-1")
-        response = textract.detect_document_text(Document={"Bytes": file_bytes})
-        print("✅ Textract API called successfully")
-
-        # Extract all text lines
-        lines = [block["Text"] for block in response.get("Blocks", []) if block["BlockType"] == "LINE"]
-        extracted_text = "\n".join(lines)
-        print(f"🧾 Extracted {len(lines)} lines from image")
-
-        # --- Heuristic parsing for amount & date ---
-        amount_match = re.findall(r"\d+(?:\.\d{1,2})?", extracted_text)
-        amount = float(amount_match[-1]) if amount_match else 0.0
-
-        date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", extracted_text)
-        date = date_match.group(1) if date_match else datetime.date.today().isoformat()
-
-        # Build transaction item
-        tx_id = str(uuid.uuid4())
-        transaction = {
-            "id": tx_id,
-            "transactionId": tx_id,
-            "userId": user_id,
-            "amount": Decimal(str(amount)),
-            "category": "uncategorized",
-            "date": date,
-            "note": "Auto-added via receipt",
-            "type": "expense",
-            "createdAt": datetime.datetime.utcnow().isoformat() + "Z",
-        }
-
-        # Save to DynamoDB
-        transactions_table.put_item(Item=transaction)
-        print(f"✅ Transaction saved in DynamoDB (ID: {tx_id})")
-
-        # Return result to frontend
-        return jsonify({
-            "message": "Receipt processed successfully",
-            "transaction": decimal_to_float(transaction),
-            "extractedText": extracted_text[:500]  # limit preview for readability
-        }), 201
-
+        return jsonify({'ok': True, 'text': text})
     except Exception as e:
-        print("❌ Error in /upload-receipt:", str(e))
-        return jsonify({"error": str(e)}), 500
-
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route("/health", methods=["GET"])
 def health():

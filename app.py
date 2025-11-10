@@ -25,9 +25,7 @@ app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 CORS(app)
-dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-s3 = boto3.client('s3', region_name='us-east-1')
-transactions_table = dynamodb.Table('Transactions')
+
 # ---------- Config / Table names ----------
 AWS_REGION = getattr(config, "AWS_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 TRANSACTIONS_TABLE = getattr(config, "TRANSACTIONS_TABLE", "Transactions")
@@ -40,6 +38,7 @@ ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "pdf"}
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 s3 = boto3.client("s3", region_name=AWS_REGION)
 textract = boto3.client("textract", region_name=AWS_REGION)
+transactions_table = dynamodb.Table('Transactions')
 
 # Ensure table objects (these will raise at runtime if table names are wrong)
 transactions_table = dynamodb.Table(TRANSACTIONS_TABLE)
@@ -109,63 +108,6 @@ def extract_text_from_s3(bucket: str, key: str) -> str:
         return ""
 
 
-def parse_amount_and_date_from_text(text: str) -> Tuple[Optional[float], Optional[str]]:
-    """
-    Simple heuristics to find the largest money-like number and common date patterns.
-    Returns (amount, date_iso) where amount is float or None, date_iso is YYYY-MM-DD or None.
-    """
-    if not text:
-        return None, None
-
-    # Match numbers like 1,234.56 or 1234.56 or 1234
-    amounts = re.findall(r"\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b|\b\d+(?:\.\d{1,2})?\b", text)
-    parsed_amounts = []
-    for a in amounts:
-        try:
-            parsed_amounts.append(float(a.replace(",", "")))
-        except Exception:
-            continue
-    amount = max(parsed_amounts) if parsed_amounts else None
-
-    # Date patterns
-    date_patterns = [
-        r"(\d{4}-\d{2}-\d{2})",  # 2025-11-08
-        r"(\d{2}/\d{2}/\d{4})",  # 08/11/2025 or 11/08/2025
-        r"(\d{2}-\d{2}-\d{4})",  # 08-11-2025
-        r"(\d{2}\.\d{2}\.\d{4})"  # 08.11.2025
-    ]
-    parsed_date = None
-    for pat in date_patterns:
-        m = re.search(pat, text)
-        if not m:
-            continue
-        s = m.group(1)
-        try:
-            if "-" in s and len(s.split("-")[0]) == 4:
-                parsed_date = s  # already YYYY-MM-DD
-            elif "/" in s:
-                # Try both common orders. We'll attempt day/month/year, then month/day/year.
-                try:
-                    dt = datetime.datetime.strptime(s, "%d/%m/%Y")
-                    parsed_date = dt.date().isoformat()
-                except Exception:
-                    try:
-                        dt = datetime.datetime.strptime(s, "%m/%d/%Y")
-                        parsed_date = dt.date().isoformat()
-                    except Exception:
-                        parsed_date = None
-            elif "-" in s:
-                dt = datetime.datetime.strptime(s, "%d-%m-%Y")
-                parsed_date = dt.date().isoformat()
-            elif "." in s:
-                dt = datetime.datetime.strptime(s, "%d.%m.%Y")
-                parsed_date = dt.date().isoformat()
-            if parsed_date:
-                break
-        except Exception:
-            continue
-
-    return amount, parsed_date
 
 
 # ---- DynamoDB insert helper ----
@@ -414,24 +356,175 @@ def export_data_to_s3():
         # print("❌ Unexpected Error:", e)
         return jsonify({"error": str(e)}), 500
 
+# ----- Helpers -------------------------------------------------------------
+def parse_amount_from_text(text: str, keywords=None) -> Optional[Decimal]:
+    """
+    Try to find an amount in text. Prefer lines containing keywords (total, amount).
+    Return Decimal or None.
+    """
+    if not text:
+        return None
+
+    if keywords is None:
+        keywords = ["total", "amount", "balance", "grand total", "net"]
+
+    # Search lines with keyword + number
+    for kw in keywords:
+        pattern = rf"(?im).*{kw}.*?([0-9]+(?:[.,][0-9]{{1,2}})?)"
+        m = re.search(pattern, text)
+        if m:
+            s = m.group(1).replace(",", ".")
+            try:
+                return Decimal(s)
+            except Exception:
+                continue
+
+    # fallback: take the last monetary-looking number in whole text
+    all_nums = re.findall(r"([0-9]+(?:[.,][0-9]{1,2})?)", text)
+    if all_nums:
+        s = all_nums[-1].replace(",", ".")
+        try:
+            return Decimal(s)
+        except Exception:
+            return None
+    return None
+
+
+def parse_date_from_text(text: str) -> Optional[str]:
+    """
+    Try to extract a date string (ISO) from text using common patterns, fallback to fuzzy parse.
+    """
+    if not text:
+        return None
+
+    # Common date patterns: dd/mm/yyyy, mm/dd/yyyy, yyyy-mm-dd
+    candidates = re.findall(r"\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2})\b", text)
+    for c in candidates:
+        try:
+            dt = parse_date(c, dayfirst=False, fuzzy=True)
+            return dt.date().isoformat()
+        except Exception:
+            continue
+
+    # Fuzzy parse entire text (last resort)
+    try:
+        dt = parse_date(text, fuzzy=True)
+        return dt.date().isoformat()
+    except Exception:
+        return None
+
+
+def ensure_table(table_name: str):
+    """Ensure DynamoDB table exists; create if absent (requires proper IAM permissions)."""
+    try:
+        table = dynamodb.Table(table_name)
+        table.load()  # will raise if table doesn't exist
+        return table
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code == "ResourceNotFoundException":
+            table = dynamodb.create_table(
+                TableName=table_name,
+                KeySchema=[{"AttributeName": "transactionId", "KeyType": "HASH"}],
+                AttributeDefinitions=[{"AttributeName": "transactionId", "AttributeType": "S"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            table.meta.client.get_waiter("table_exists").wait(TableName=table_name)
+            return dynamodb.Table(table_name)
+        else:
+            raise
+
 # ----------upload file
 
-@app.route('/upload-receipt', methods=['POST'])
+@app.route("/upload-receipt", methods=["POST"])
 def upload_receipt():
+    """
+    Accepts form-data:
+      - file: image file (required)
+      - category: optional string
+      - userId (optional) in form-data or X-User-Id header
+    Returns:
+      { ok: true, transaction: { transactionId, userId, vendor, total, tax, date, category, rawText, createdAt } }
+    """
     try:
-        if 'receipt' not in request.files:
-            return jsonify({'error': 'No file uploaded'}), 400
-        
-        file = request.files['receipt']
-        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-        file.save(filepath)
+        if "file" not in request.files:
+            return jsonify({"ok": False, "error": "No file field 'file' provided"}), 400
 
-        # Run Tesseract OCR
-        text = pytesseract.image_to_string(Image.open(filepath))
+        f = request.files["file"]
+        category = (request.form.get("category") or "").strip()
+        user_id = request.form.get("userId") or request.headers.get("X-User-Id") or "anonymous"
 
-        return jsonify({'ok': True, 'text': text})
+        # Save upload
+        filename = f.filename or f"{uuid.uuid4().hex}.jpg"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        f.save(filepath)
+
+        # Preprocess image to improve OCR accuracy
+        img = Image.open(filepath)
+        img = img.convert("L")  # grayscale
+        img = ImageOps.autocontrast(img)
+        img = img.filter(ImageFilter.MedianFilter())
+
+        # OCR
+        raw_text = pytesseract.image_to_string(img, lang="eng")
+
+        # Extract fields
+        total = parse_amount_from_text(raw_text, ["total", "amount", "grand total", "net", "balance"])
+        tax = parse_amount_from_text(raw_text, ["tax", "vat"])
+        date_iso = parse_date_from_text(raw_text)
+
+        # Vendor detection: first non-empty line (conservative)
+        lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+        vendor = lines[0] if lines else ""
+
+        # Build transaction item
+        transaction_id = str(uuid.uuid4())
+        created_at = datetime.utcnow().isoformat()
+
+        item = {
+            "transactionId": transaction_id,
+            "userId": str(user_id),
+            "vendor": vendor,
+            "rawText": raw_text,
+            "createdAt": created_at,
+        }
+        if category:
+            item["category"] = category
+        if total is not None:
+            item["total"] = Decimal(str(total))   # store as Decimal for DynamoDB numeric type
+        if tax is not None:
+            item["tax"] = Decimal(str(tax))
+        if date_iso:
+            item["transactionDate"] = date_iso
+
+        # Save to DynamoDB
+        table = ensure_table(transactions_table)
+        table.put_item(Item=item)
+
+        # Convert Decimals to strings for JSON response
+        out_item = item.copy()
+        if "total" in out_item:
+            out_item["total"] = str(out_item["total"])
+        if "tax" in out_item:
+            out_item["tax"] = str(out_item["tax"])
+
+        transaction_response = {
+            "transactionId": out_item["transactionId"],
+            "userId": out_item["userId"],
+            "vendor": out_item.get("vendor", ""),
+            "total": out_item.get("total"),
+            "tax": out_item.get("tax"),
+            "date": out_item.get("transactionDate"),
+            "category": out_item.get("category", ""),
+            "rawText": out_item.get("rawText", ""),
+            "createdAt": out_item.get("createdAt"),
+        }
+
+        return jsonify({"ok": True, "transaction": transaction_response})
+
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+        app.logger.exception("upload error")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/health", methods=["GET"])
 def health():

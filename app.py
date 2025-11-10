@@ -436,27 +436,122 @@ def ensure_table(table_name: str):
 
 # ----------upload file
 
+def ensure_table(table_name):
+    """Ensure DynamoDB table exists or create it."""
+    try:
+        table = dynamodb.Table(table_name)
+        table.load()
+    except:
+        table = dynamodb.create_table(
+            TableName=table_name,
+            KeySchema=[{"AttributeName": "transactionId", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "transactionId", "AttributeType": "S"}
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table.meta.client.get_waiter("table_exists").wait(TableName=table_name)
+    return table
+
+# ----------------------------------------
+# 🧠 Utility Functions for OCR Extraction
+# ----------------------------------------
+
+def extract_total(text):
+    """Extract the total amount using regex patterns."""
+    pattern = r"(?i)(total|amount|balance)[^\d]*([\d,]+\.\d{2})"
+    match = re.search(pattern, text)
+    if match:
+        return float(match.group(2).replace(",", ""))
+    # fallback: look for standalone amounts like 123.45
+    all_amounts = re.findall(r"\b\d{1,5}\.\d{2}\b", text)
+    if all_amounts:
+        return float(all_amounts[-1])
+    return None
+
+def extract_date(text):
+    """Extract date in various formats."""
+    pattern = r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+    match = re.search(pattern, text)
+    if match:
+        try:
+            raw = match.group(1)
+            return str(datetime.strptime(raw, "%d/%m/%Y").date())
+        except:
+            try:
+                return str(datetime.strptime(raw, "%m/%d/%Y").date())
+            except:
+                return raw  # fallback as string
+    return None
+
+def extract_vendor(text):
+    """Guess vendor/store from first non-empty text line."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[0] if lines else "Unknown Vendor"
+
+# ----------------------------------------
+# 📸 Upload Route
+# ----------------------------------------
+
 @app.route("/upload-receipt", methods=["POST"])
 def upload_receipt():
-    # Accept either "file" or "receipt" from the frontend
-    file_field = request.files.get("file") or request.files.get("receipt")
-    if not file_field:
-        # log keys to help debug
-        current_app.logger.info(f"request.files keys: {list(request.files.keys())}")
-        current_app.logger.info(f"request.form keys: {list(request.form.keys())}")
-        return jsonify({"ok": False, "error": "No file uploaded"}), 400
+    try:
+        # Accept file (field name "file" or "receipt")
+        file = request.files.get("file") or request.files.get("receipt")
+        if not file:
+            print("DEBUG: request.files keys:", list(request.files.keys()))
+            print("DEBUG: request.form keys:", list(request.form.keys()))
+            return jsonify({"ok": False, "error": "No file uploaded"}), 400
 
-    # save and do OCR (simplified)
-    filename = file_field.filename or f"{uuid.uuid4().hex}.jpg"
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    file_field.save(filepath)
-    img = Image.open(filepath).convert("L")
-    text = pytesseract.image_to_string(img, lang="eng")
+        # Category from form
+        category = (request.form.get("category") or "").strip()
+        user_id = request.form.get("userId") or "default-user"
 
-    # (optional) save to DynamoDB here...
+        # Save file locally
+        filename = file.filename or f"{uuid.uuid4().hex}.jpg"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(filepath)
+        print(f"✅ File saved to {filepath}")
 
-    return jsonify({"ok": True, "text": text, "transaction": None})
+        # Preprocess image for OCR
+        img = Image.open(filepath).convert("L")
+        img = ImageOps.autocontrast(img)
+        img = img.filter(ImageFilter.MedianFilter())
 
+        # Extract text
+        text = pytesseract.image_to_string(img, lang="eng")
+        print("🧾 Extracted text sample:\n", text[:400])
+
+        # Extract details
+        total = extract_total(text)
+        date = extract_date(text)
+        vendor = extract_vendor(text)
+
+        # Build transaction item
+        transaction = {
+            "transactionId": str(uuid.uuid4()),
+            "userId": user_id,
+            "vendor": vendor,
+            "total": Decimal(str(total)) if total else None,
+            "date": date,
+            "category": category or "Uncategorized",
+            "createdAt": datetime.utcnow().isoformat(),
+            "rawText": text,
+        }
+
+        # Save to DynamoDB
+        # table = ensure_table()
+        # table.put_item(Item={k: v for k, v in transaction.items() if v is not None})
+
+        # Prepare response (convert Decimal to str)
+        transaction["total"] = str(transaction["total"]) if transaction["total"] else None
+
+        return jsonify({"ok": True, "message": "Receipt processed successfully", "transaction": transaction}), 200
+
+    except Exception as e:
+        print("❌ Error in upload_receipt:", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "timestamp": datetime.datetime.utcnow().isoformat() + "Z"}), 200

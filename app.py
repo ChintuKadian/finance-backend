@@ -5,7 +5,7 @@ import io
 import re
 import uuid
 import json
-import datetime
+from datetime import datetime, date, timezone
 from decimal import Decimal
 from typing import Optional, Dict, Any
 
@@ -168,10 +168,10 @@ def add_transaction():
             "userId": data.get("userId", "default_user"),
             "amount": Decimal(str(data.get("amount", 0))),
             "category": data.get("category", "uncategorized"),
-            "date": data.get("date", datetime.date.today().isoformat()),
+            "date": data.get("date", date.today().isoformat()),
             "note": data.get("note", ""),
             "type": data.get("type", "expense"),
-            "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "createdAt": datetime.now(timezone.utc).isoformat(),
         }
         transactions_table.put_item(Item=item)
         return jsonify(decimal_to_float(item)), 201
@@ -543,7 +543,7 @@ def upload_receipt():
             "total": Decimal(str(total)) if total else None,
             "date": date,
             "category": category or "Uncategorized",
-            "createdAt": datetime.datetime.utcnow().isoformat(),
+            "createdAt": datetime.utcnow().isoformat(),
             "rawText": text,
         }
 

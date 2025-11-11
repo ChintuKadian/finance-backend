@@ -20,8 +20,7 @@ from werkzeug.utils import secure_filename
 import boto3
 from botocore.exceptions import ClientError
 
-import config  # your local config module (optional)
-
+import config  
 # -------------------- App / config --------------------
 app = Flask(__name__)
 CORS(app)
